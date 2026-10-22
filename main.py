@@ -1123,6 +1123,12 @@ class MinecraftLauncher:
             self.VerDescription, text="版本信息", font=("等线", 25)
         )
         self.VerDescriptionLabel.place(x=20, y=0)
+        self.DeleteVersionButton = tk.Button(
+            self.VerDescription,
+            text="删除当前版本",
+            command=self.delete_version,
+        )
+        self.DeleteVersionButton.place(x=430, y=10)
         self.supply_mod_loading = tk.Label(self.VerDescription, text="支持mod加载:")
         self.supply_mod_loading.place(x=20, y=60)
         self.VersionListListBox.bind(
@@ -1915,6 +1921,51 @@ class MinecraftLauncher:
             daemon=True,
         ).start()
         print("成功创建下载任务:", version)
+
+    def delete_version(self):
+        """删除当前选中的已安装版本"""
+        selection = self.VersionListListBox.curselection()
+        if selection == ():
+            tkinter.messagebox.showerror("错误", "你没有选择要删除的版本!")
+            return
+        if self.downloading:
+            tkinter.messagebox.showinfo("提示", "正在下载版本，请等下载完成后再删除。")
+            return
+        index = selection[0]
+        version = self.VersionListListBox.get(index)
+        if not version or version == "暂无数据":
+            return
+        version_dir = os.path.join(self.minecraft_dir, "versions", version)
+        if not os.path.isdir(version_dir):
+            tkinter.messagebox.showerror("错误", f"找不到版本文件夹:{version_dir}")
+            return
+        if not tkinter.messagebox.askyesno(
+            "删除版本",
+            f"确定要删除版本「{version}」吗？\n"
+            f"文件夹: {version_dir}\n"
+            "该版本文件夹里的 mod、存档、配置等都会被一起删除，且无法恢复。",
+        ):
+            return
+        try:
+            shutil.rmtree(version_dir)
+        except OSError as exp:
+            tkinter.messagebox.showerror("错误", f"删除失败:{exp}")
+            return
+        self.reload_versions()
+        self.VersionListListBox.delete(0, tk.END)
+        for i in self.downloaded_minecraft_versions:
+            if i != "" and not i.isspace():
+                self.VersionListListBox.insert(0, i)
+        if self.selected_version == version:
+            self.selected_version = "暂无数据"
+            self.support_mod = False
+            self.modlistlist = []
+            self.ModListListBox.delete(0, tk.END)
+            self.Start_Game_Label.config(
+                text=f"是时候启动游戏了！\n正在使用的账户:{self.Username}\n准备启动游戏:{self.selected_version}"
+            )
+        self.save_all()
+        tkinter.messagebox.showinfo("完成", f"已删除版本:{version}")
 
     def change_version_and_modify_version(self):
         self.set_current_page("modify")
