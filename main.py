@@ -730,6 +730,7 @@ class MinecraftLauncher:
         except OSError:
             self.downloaded_minecraft_versions = []
         self.download_version_to = ""
+        self.version_list_items = None
         self.support_fabric = ""
         self.support_forge = ""
         self.game_processes = []
@@ -1261,7 +1262,7 @@ class MinecraftLauncher:
     def create_all(self):
         self.Download_Button = tk.Button(
             self.main_win,
-            text="下载版本",
+            text="下载中心",
             width=20,
             height=25,
             command=self.from_menu_to_download_page,
@@ -1472,7 +1473,7 @@ class MinecraftLauncher:
         )
         self.VersionDescription.place(x=1350, y=5)
         self.VersionDescriptionLabel = tk.Label(
-            self.VersionDescription, text="版本概述", font=("等线", 25)
+            self.VersionDescription, text="下载中心", font=("等线", 25)
         )
         self.VersionDescriptionLabel.place(x=20, y=0)
         self.SupportForgeLabel = tk.Label(self.VersionDescription, text="Forge支持:")
@@ -1514,6 +1515,44 @@ class MinecraftLauncher:
             command=self.download_minecraft_version_theard,
         )
         self.DownloadButton.place(x=20, y=150)
+
+        # ---- 下载中心分类 ----
+        self.DownloadCategories = ["游戏版本", "模组", "整合包", "资源包", "光影"]
+        self.DownloadCategoryButtons = {}
+        self.download_category = None
+        category_x = 260
+        for category in self.DownloadCategories:
+            category_button = tk.Button(
+                self.VersionDescription,
+                text=category,
+                relief="ridge",
+                width=6,
+                command=lambda name=category: self.switch_download_category(name),
+            )
+            category_button.place(x=category_x, y=6)
+            self.DownloadCategoryButtons[category] = category_button
+            category_x += 80
+        self.download_version_widgets = [
+            (self.SupportForgeLabel, 20, 60),
+            (self.SupportFabricLabel, 20, 80),
+            (self.ModLoaderLabel, 20, 100),
+            (self.ModLoaderOption, 150, 100),
+            (self.ModLoaderVersionLabel, 20, 120),
+            (self.ModLoaderVersionOption, 150, 120),
+            (self.DownloadButton, 20, 150),
+        ]
+        self.DownloadPlaceholder = ttk.Frame(
+            self.VersionDescription, width=700, height=330
+        )
+        self.DownloadPlaceholderLabel = tk.Label(
+            self.DownloadPlaceholder,
+            text="",
+            font=("等线", 15),
+            wraplength=660,
+            justify="left",
+        )
+        self.DownloadPlaceholderLabel.place(x=10, y=20)
+        self.switch_download_category("游戏版本")
 
         self.Menu_Butt_modify = tk.Button(
             self.main_win, text="🏠", command=self.delete_modify
@@ -3595,6 +3634,8 @@ class MinecraftLauncher:
                 self.username_listbox.insert(tk.END, i)
 
     def check_support(self, *args):
+        if getattr(self, "download_category", "游戏版本") != "游戏版本":
+            return
         selection = self.version_listbox.curselection()
         if selection == ():
             return
@@ -4564,10 +4605,60 @@ class MinecraftLauncher:
             daemon=True,
         ).start()
 
+    def switch_download_category(self, name):
+        if name not in self.DownloadCategoryButtons:
+            return
+        if getattr(self, "download_category", None) == name:
+            return
+        self.download_category = name
+        for category, button in self.DownloadCategoryButtons.items():
+            button.config(relief="sunken" if category == name else "ridge")
+        if name == "游戏版本":
+            self.DownloadPlaceholder.place_forget()
+            for widget, x, y in self.download_version_widgets:
+                widget.place(x=x, y=y)
+            self.restore_download_version_list()
+        else:
+            for widget, _x, _y in self.download_version_widgets:
+                widget.place_forget()
+            self.DownloadPlaceholderLabel.config(
+                text=(
+                    f"「{name}」下载功能将在后续版本加入。\n\n"
+                    "现在可以切换到「游戏版本」下载游戏，"
+                    "或者用杂项设置里的 NBT 查看器编辑存档。"
+                )
+            )
+            self.DownloadPlaceholder.place(x=20, y=60)
+            self.show_download_category_hint(name)
+
+    def show_download_category_hint(self, name):
+        try:
+            self.version_listbox.unbind("<<ListboxSelect>>")
+            self.version_listbox.delete(0, tk.END)
+            self.version_listbox.insert(tk.END, f"「{name}」暂未支持")
+        except tk.TclError:
+            pass
+
+    def restore_download_version_list(self):
+        try:
+            self.version_listbox.delete(0, tk.END)
+            items = getattr(self, "version_list_items", None)
+            if items is None:
+                self.version_listbox.insert(tk.END, "正在加载...")
+            elif not items:
+                self.version_listbox.insert(tk.END, "网络不畅，请稍后重试。")
+            else:
+                for item in items:
+                    self.version_listbox.insert(tk.END, item["id"])
+            self.version_listbox.bind("<<ListboxSelect>>", self.check_support)
+        except tk.TclError:
+            pass
+
     def from_menu_to_download_page(self):
         self.create_download()
         self.delete_main()
         self.download_page_open = True
+        self.switch_download_category("游戏版本")
         self.set_current_page("download")
 
         def gtv():
@@ -4577,6 +4668,10 @@ class MinecraftLauncher:
         threading.Thread(target=gtv, daemon=True).start()
 
     def reload_version_listbox(self, versionlist):
+        self.version_list_items = versionlist
+        if getattr(self, "download_category", "游戏版本") != "游戏版本":
+            self.show_download_category_hint(self.download_category)
+            return
         self.version_listbox.delete(0, tk.END)
         if not versionlist:
             self.version_listbox.insert(tk.END, "网络不畅，请稍后重试。")
