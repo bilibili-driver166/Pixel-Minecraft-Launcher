@@ -733,6 +733,8 @@ class MinecraftLauncher:
         self.support_fabric = ""
         self.support_forge = ""
         self.game_processes = []
+        self._wmic_unavailable = False
+        self._powershell_unavailable = False
         self.current_progress = 0
         self.downloading = False
         self.close_button_visible = False
@@ -751,6 +753,10 @@ class MinecraftLauncher:
         self._nbt_zip = None
         self._nbt_zip_path = None
         self._nbt_icon_cache = {}
+        self._nbt_item_list_cache = None
+        self._nbt_item_list_cache_key = None
+        self._nbt_item_names_cache = None
+        self._nbt_item_names_key = None
         self._nbt_hover_row = None
         self._nbt_tooltip = None
         self._nbt_tooltip_image = None
@@ -921,23 +927,28 @@ class MinecraftLauncher:
             return []
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         output = ""
-        try:
-            output = subprocess.check_output(
-                [
-                    "wmic",
-                    "process",
-                    "where",
-                    "name='java.exe' or name='javaw.exe'",
-                    "get",
-                    "ProcessId,CommandLine",
-                    "/FORMAT:CSV",
-                ],
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-                creationflags=creation_flags,
-            ).decode("utf-8", errors="ignore")
-        except Exception as exp:
-            print(f"[WARN] wmic 列举进程失败: {exp}")
+        wmic_ok = False
+        if not self._wmic_unavailable:
+            try:
+                output = subprocess.check_output(
+                    [
+                        "wmic",
+                        "process",
+                        "where",
+                        "name='java.exe' or name='javaw.exe'",
+                        "get",
+                        "ProcessId,CommandLine",
+                        "/FORMAT:CSV",
+                    ],
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    creationflags=creation_flags,
+                ).decode("utf-8", errors="ignore")
+                wmic_ok = True
+            except Exception as exp:
+                self._wmic_unavailable = True
+                print(f"[WARN] wmic 不可用, 之后改用 PowerShell: {exp}")
+        if not wmic_ok and not self._powershell_unavailable:
             try:
                 output = subprocess.check_output(
                     [
@@ -954,6 +965,7 @@ class MinecraftLauncher:
                     creationflags=creation_flags,
                 )
             except Exception as powershell_exp:
+                self._powershell_unavailable = True
                 print(f"[WARN] 无法枚举游戏进程: {powershell_exp}")
                 return sorted(pids)
 
@@ -2604,7 +2616,13 @@ class MinecraftLauncher:
                 "提示", "Compound / List / 数组节点不能直接编辑值。"
             )
             return
-        ok, value = self.prompt_nbt_value(tag)
+        if tag.tag_type == NBT_STRING and self.is_item_id_node(iid, tag):
+            if self.list_nbt_items():
+                ok, value = self.prompt_item_id(tag.value)
+            else:
+                ok, value = self.prompt_nbt_value(tag)
+        else:
+            ok, value = self.prompt_nbt_value(tag)
         if not ok:
             return
         tag.value = value
@@ -2937,6 +2955,10 @@ class MinecraftLauncher:
         self._nbt_zip = None
         self._nbt_zip_path = None
         self._nbt_icon_cache = {}
+        self._nbt_item_list_cache = None
+        self._nbt_item_list_cache_key = None
+        self._nbt_item_names_cache = None
+        self._nbt_item_names_key = None
 
     def get_nbt_item_icon(self, item_id):
         """从当前版本的客户端 jar 里取物品图标"""
@@ -2968,6 +2990,261 @@ class MinecraftLauncher:
             break
         self._nbt_icon_cache[item_id] = image
         return image
+
+    def list_nbt_items(self):
+        """列出当前版本可用的原版物品 id"""
+        jar = self.get_nbt_version_jar()
+        if jar is None:
+            return []
+        if (
+            self._nbt_item_list_cache is not None
+            and self._nbt_item_list_cache_key == jar
+        ):
+            return self._nbt_item_list_cache
+        zip_file = self.get_nbt_texture_zip()
+        if zip_file is None:
+            return []
+        names = zip_file.namelist()
+        items = set()
+        for prefix in (
+            "assets/minecraft/items/",
+            "assets/minecraft/models/item/",
+        ):
+            for name in names:
+                if not name.startswith(prefix) or not name.endswith(".json"):
+                    continue
+                item = name[len(prefix) : -len(".json")]
+                if item and "/" not in item:
+                    items.add("minecraft:" + item)
+            if items:
+                break
+        if not items:
+            prefix = "assets/minecraft/textures/item/"
+            for name in names:
+                if not name.startswith(prefix) or not name.endswith(".png"):
+                    continue
+                item = name[len(prefix) : -len(".png")]
+                if item and "/" not in item:
+                    items.add("minecraft:" + item)
+        result = sorted(items)
+        self._nbt_item_list_cache = result
+        self._nbt_item_list_cache_key = jar
+        return result
+
+    def get_nbt_asset_index_id(self):
+        """找到当前版本使用的 assets 索引 id"""
+        versions_dir = os.path.join(self.minecraft_dir, "versions")
+        current = str(self.selected_version or "")
+        seen = set()
+        while current and current not in seen:
+            seen.add(current)
+            json_path = os.path.join(versions_dir, current, current + ".json")
+            try:
+                with open(json_path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                return None
+            asset_index = data.get("assetIndex") or {}
+            index_id = asset_index.get("id")
+            if index_id:
+                return index_id
+            current = data.get("inheritsFrom")
+        return None
+
+    def load_nbt_lang_from_assets(self, index_id, lang_name):
+        """从 .minecraft/assets 里读取语言文件"""
+        index_path = os.path.join(
+            self.minecraft_dir, "assets", "indexes", index_id + ".json"
+        )
+        try:
+            with open(index_path, encoding="utf-8") as f:
+                index_data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        obj = (index_data.get("objects") or {}).get(
+            "minecraft/lang/" + lang_name
+        )
+        if not obj:
+            return {}
+        hash_value = str(obj.get("hash", ""))
+        if len(hash_value) < 2:
+            return {}
+        obj_path = os.path.join(
+            self.minecraft_dir, "assets", "objects", hash_value[:2], hash_value
+        )
+        try:
+            with open(obj_path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def get_nbt_item_names(self):
+        """读取物品显示名(优先本地 assets 的中文语言文件)"""
+        jar = self.get_nbt_version_jar()
+        if jar is None:
+            return {}
+        index_id = self.get_nbt_asset_index_id()
+        cache_key = (jar, index_id)
+        if (
+            self._nbt_item_names_cache is not None
+            and self._nbt_item_names_key == cache_key
+        ):
+            return self._nbt_item_names_cache
+        zip_file = self.get_nbt_texture_zip()
+        lang = {}
+        if index_id:
+            lang = self.load_nbt_lang_from_assets(index_id, "zh_cn.json")
+        if not lang and zip_file is not None:
+            for lang_name in ("zh_cn.json", "en_us.json"):
+                try:
+                    raw = zip_file.read("assets/minecraft/lang/" + lang_name)
+                    lang = json.loads(raw.decode("utf-8"))
+                    break
+                except (KeyError, ValueError):
+                    continue
+        names = {}
+        if lang:
+            for item_id in self.list_nbt_items():
+                path = item_id.split(":", 1)[1]
+                name = (
+                    lang.get("item.minecraft." + path)
+                    or lang.get("block.minecraft." + path)
+                    or ""
+                )
+                if name:
+                    names[item_id] = name
+        self._nbt_item_names_cache = names
+        self._nbt_item_names_key = cache_key
+        return names
+
+    def is_item_id_node(self, iid, tag):
+        """判断这个节点是不是物品的 id 字段(父节点带 Count)"""
+        if tag is None or tag.tag_type != NBT_STRING or tag.name != "id":
+            return False
+        parent = self.nbt_tree.parent(iid)
+        parent_tag = self._nbt_tags.get(parent)
+        if parent_tag is None or parent_tag.tag_type != NBT_COMPOUND:
+            return False
+        count = parent_tag.value.get("Count")
+        return count is not None and count.tag_type in (NBT_BYTE, NBT_INT)
+
+    def prompt_item_id(self, current):
+        """物品选择器: 搜索 + 图标预览"""
+        items = self.list_nbt_items()
+        names = self.get_nbt_item_names()
+        if not items:
+            return False, None
+        dialog = tk.Toplevel(self.nbt_window)
+        dialog.title("选择物品")
+        dialog.geometry("640x560")
+        dialog.transient(self.nbt_window)
+        dialog.grab_set()
+        search_var = tk.StringVar()
+        search_entry = tk.Entry(dialog, textvariable=search_var)
+        search_entry.pack(fill="x", padx=10, pady=(10, 4))
+        search_entry.focus_set()
+
+        list_frame = tk.Frame(dialog)
+        list_frame.pack(fill="both", expand=True, padx=10)
+        listbox = tk.Listbox(list_frame, height=18)
+        scrollbar = ttk.Scrollbar(
+            list_frame, orient="vertical", command=listbox.yview
+        )
+        listbox.configure(yscrollcommand=scrollbar.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        preview = tk.Frame(dialog)
+        preview.pack(fill="x", padx=10, pady=6)
+        icon_label = tk.Label(preview)
+        icon_label.pack(side="left")
+        info_var = tk.StringVar(value="未选择")
+        tk.Label(preview, textvariable=info_var, anchor="w", justify="left").pack(
+            side="left", padx=8
+        )
+
+        button_frame = tk.Frame(dialog)
+        button_frame.pack(fill="x", padx=10, pady=(0, 10))
+        result = {"ok": False, "value": None}
+        filtered = []
+
+        def update_preview(event=None):
+            selection = listbox.curselection()
+            if not selection:
+                return
+            item_id = filtered[selection[0]]
+            icon = self.get_nbt_item_icon(item_id)
+            if icon is not None:
+                icon_label.config(image=icon)
+                icon_label.image = icon
+            else:
+                icon_label.config(image="")
+                icon_label.image = None
+            name = names.get(item_id, "")
+            info_var.set(f"{name}\n{item_id}" if name else item_id)
+
+        def refresh_list(event=None):
+            text = search_var.get().strip().lower()
+            listbox.delete(0, "end")
+            filtered.clear()
+            for item_id in items:
+                name = names.get(item_id, "")
+                if text and text not in item_id.lower() and text not in name.lower():
+                    continue
+                filtered.append(item_id)
+                label = f"{name}  ({item_id})" if name else item_id
+                listbox.insert("end", label)
+                if len(filtered) >= 600:
+                    break
+            if not filtered:
+                info_var.set("没有匹配的物品")
+                icon_label.config(image="")
+                return
+            try:
+                index = filtered.index(current)
+            except ValueError:
+                index = 0
+            listbox.selection_clear(0, "end")
+            listbox.selection_set(index)
+            listbox.activate(index)
+            listbox.see(index)
+            update_preview()
+
+        def on_ok(event=None):
+            selection = listbox.curselection()
+            if selection:
+                value = filtered[selection[0]]
+            else:
+                text = search_var.get().strip()
+                if not text:
+                    tkinter.messagebox.showinfo("提示", "请选择一个物品。", parent=dialog)
+                    return
+                value = text if ":" in text else "minecraft:" + text
+            result["ok"] = True
+            result["value"] = value
+            dialog.destroy()
+
+        def on_cancel(event=None):
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="确定", command=on_ok).pack(side="right")
+        ttk.Button(button_frame, text="取消", command=on_cancel).pack(
+            side="right", padx=(0, 6)
+        )
+        tk.Label(
+            dialog,
+            text="可以输入物品名或 id 过滤；双击直接选择。",
+            anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 8))
+        search_entry.bind("<KeyRelease>", refresh_list)
+        search_entry.bind("<Return>", on_ok)
+        listbox.bind("<<ListboxSelect>>", update_preview)
+        listbox.bind("<Double-Button-1>", on_ok)
+        dialog.bind("<Escape>", on_cancel)
+        refresh_list()
+        self.center_nbt_dialog(dialog)
+        dialog.wait_window()
+        return result["ok"], result["value"]
 
     def get_nbt_item_id(self, iid):
         """从节点或其上级 Compound 里找物品 id"""
