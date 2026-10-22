@@ -376,6 +376,10 @@ class MinecraftLauncher:
         self.current_progress = 0
         self.downloading = False
         self.close_button_visible = False
+        self.progress_button_visible = False
+        self.progress_page_open = False
+        self.download_page_open = False
+        self.current_page = "main"
 
     def __init__(self):
         self._ui_queue = queue.Queue()
@@ -435,6 +439,15 @@ class MinecraftLauncher:
             command=self.close_all_games,
         )
         self.close_button_visible = False
+        # 下载进度按钮: 和关闭游戏一样在窗口外面, 有下载时才从左侧滑入
+        self.ProgressButton = tk.Button(
+            self.main_win,
+            text="查看下载进度",
+            relief="groove",
+            command=self.show_download_progress,
+        )
+        self.ProgressButton.place(x=-200, y=530)
+        self.progress_button_visible = False
 
         self.create_all()
         self.create_main()
@@ -667,6 +680,7 @@ class MinecraftLauncher:
         ).start()
 
     def create_main(self):
+        self.set_current_page("main")
         self.Modify_Button.config(state=tk.NORMAL)
         # 开始写控件类
         animation.MoveTkWidget(
@@ -754,6 +768,7 @@ class MinecraftLauncher:
         self.version_listbox.insert(0, message)
 
     def delete_download(self):
+        self.download_page_open = False
         animation.MoveTkWidget(
             self.Menu_Butt_download,
             (-50, 0),
@@ -1089,13 +1104,6 @@ class MinecraftLauncher:
             command=self.download_minecraft_version_theard,
         )
         self.DownloadButton.place(x=20, y=150)
-        # 下载开始后才显示的进度按钮
-        self.ProgressButton = tk.Button(
-            self.VersionDescription,
-            text="查看下载进度",
-            command=self.show_download_progress,
-        )
-        self.progress_button_visible = False
 
         self.Menu_Butt_modify = tk.Button(
             self.main_win, text="🏠", command=self.delete_modify
@@ -1909,6 +1917,7 @@ class MinecraftLauncher:
         print("成功创建下载任务:", version)
 
     def change_version_and_modify_version(self):
+        self.set_current_page("modify")
         self.reload_versions()
         self.delete_main()
         self.create_modify()
@@ -1983,6 +1992,7 @@ class MinecraftLauncher:
         self.apply_background(None)
 
     def from_menu_to_PML_settings_page(self):
+        self.set_current_page("settings")
         self.delete_main()
         self.create_PML_settings()
 
@@ -2123,6 +2133,7 @@ class MinecraftLauncher:
         ).start()
 
     def from_menu_to_user_settigs_page(self):
+        self.set_current_page("user")
         self.delete_main()
         self.create_user()
         self.username_listbox.delete(0, "end")
@@ -2397,6 +2408,42 @@ class MinecraftLauncher:
             self.current_max = 0
         self.ui_call(self.update_progress_ui)
 
+    def set_progress_button_visible(self, visible):
+        """显示/隐藏"查看下载进度"按钮(从左侧滑入/滑出)"""
+        if visible and not self.progress_button_visible:
+            self.ProgressButton.place(x=-200, y=530)
+            animation.MoveTkWidget(
+                self.ProgressButton,
+                (215, 0),
+                500,
+                fps=60,
+                controller=animation.smooth,
+            ).start()
+            self.progress_button_visible = True
+        elif not visible and self.progress_button_visible:
+            animation.MoveTkWidget(
+                self.ProgressButton,
+                (-215, 0),
+                500,
+                fps=60,
+                controller=animation.smooth,
+            ).start()
+            self.progress_button_visible = False
+
+    def set_current_page(self, page):
+        """记录当前页面, 用于决定下载进度按钮要不要显示"""
+        self.current_page = page
+        self.refresh_progress_button()
+
+    def refresh_progress_button(self):
+        """只有正在下载且在主界面/下载页/进度页时才显示进度按钮"""
+        visible = bool(self.downloading) and self.current_page in (
+            "main",
+            "download",
+            "progress",
+        )
+        self.set_progress_button_visible(visible)
+
     def start_download_ui(self, version="", mod_loader=""):
         """开始下载时重置进度并显示"查看下载进度"按钮"""
         self.downloading = True
@@ -2408,9 +2455,7 @@ class MinecraftLauncher:
         else:
             self.progress_version_var.set("")
         self.DownloadButton.config(state=tk.DISABLED)
-        if not self.progress_button_visible:
-            self.ProgressButton.place(x=260, y=150)
-            self.progress_button_visible = True
+        self.refresh_progress_button()
         self.update_progress_ui()
 
     def finish_download_ui(self, success):
@@ -2418,6 +2463,7 @@ class MinecraftLauncher:
         self.DownloadButton.config(state=tk.NORMAL)
         self.status = "下载完成" if success else "下载失败"
         self.update_progress_ui()
+        self.refresh_progress_button()
 
     def create_progress_page(self):
         """滑入下载进度页"""
@@ -2455,6 +2501,9 @@ class MinecraftLauncher:
 
     def from_download_to_progress_page(self):
         """从下载页切换到下载进度页"""
+        if self.progress_page_open:
+            return
+        self.progress_page_open = True
         animation.MoveTkWidget(
             self.Menu_Butt_download,
             (-50, 0),
@@ -2477,16 +2526,37 @@ class MinecraftLauncher:
             controller=animation.smooth,
         ).start()
         self.create_progress_page()
+        self.set_current_page("progress")
+        self.update_progress_ui()
+
+    def from_main_to_progress_page(self):
+        """从主界面直接打开下载进度页(下载时点外面的进度按钮)"""
+        self.delete_main()
+        self.create_progress_page()
+        self.progress_page_open = True
+        self.set_current_page("progress")
         self.update_progress_ui()
 
     def from_progress_to_download_page(self):
-        """从下载进度页返回下载页"""
+        """从下载进度页返回(回到下载页或主界面)"""
+        if not self.progress_page_open:
+            return
+        self.progress_page_open = False
         self.delete_progress_page()
-        self.create_download()
+        if self.download_page_open:
+            self.create_download()
+            self.set_current_page("download")
+        else:
+            self.create_main()
 
     def show_download_progress(self):
         """查看下载进度(切换到下载进度页)"""
-        self.from_download_to_progress_page()
+        if self.progress_page_open:
+            return
+        if self.download_page_open:
+            self.from_download_to_progress_page()
+        else:
+            self.from_main_to_progress_page()
 
     def update_progress_ui(self):
         maximum = self.current_max or 0
@@ -2890,6 +2960,7 @@ class MinecraftLauncher:
         ).start()
 
     def from_menu_to_server_page(self):
+        self.set_current_page("server")
         self.delete_main()
         self.create_server_page()
         # 列表控件是复用的, 每次进入页面都要先清空, 否则会重复插入
@@ -3043,6 +3114,8 @@ class MinecraftLauncher:
     def from_menu_to_download_page(self):
         self.create_download()
         self.delete_main()
+        self.download_page_open = True
+        self.set_current_page("download")
 
         def gtv():
             versionlist = self.get_version_list()
