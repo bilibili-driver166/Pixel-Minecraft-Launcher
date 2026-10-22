@@ -4,12 +4,15 @@ import minecraft_launcher_lib as mll
 import os
 import time
 import ast
+import gzip
 import hashlib
 import inspect
+import io
 import json
 import locale
 import queue
 import re
+import struct
 import urllib.request
 import uuid
 import maliang.animation as animation
@@ -226,6 +229,209 @@ def required_java_version(minecraft_version: str) -> int:
     return 8
 
 
+# ---------------------------------------------------------------------------
+# NBT 只读解析(用于 NBT 查看器)
+# ---------------------------------------------------------------------------
+NBT_END = 0
+NBT_BYTE = 1
+NBT_SHORT = 2
+NBT_INT = 3
+NBT_LONG = 4
+NBT_FLOAT = 5
+NBT_DOUBLE = 6
+NBT_BYTE_ARRAY = 7
+NBT_STRING = 8
+NBT_LIST = 9
+NBT_COMPOUND = 10
+NBT_INT_ARRAY = 11
+NBT_LONG_ARRAY = 12
+
+NBT_TAG_NAMES = {
+    NBT_END: "End",
+    NBT_BYTE: "Byte",
+    NBT_SHORT: "Short",
+    NBT_INT: "Int",
+    NBT_LONG: "Long",
+    NBT_FLOAT: "Float",
+    NBT_DOUBLE: "Double",
+    NBT_BYTE_ARRAY: "Byte[]",
+    NBT_STRING: "String",
+    NBT_LIST: "List",
+    NBT_COMPOUND: "Compound",
+    NBT_INT_ARRAY: "Int[]",
+    NBT_LONG_ARRAY: "Long[]",
+}
+NBT_MAX_DEPTH = 256
+NBT_MAX_ELEMENTS = 10_000_000
+
+
+class NbtTag:
+    """一个 NBT 标签(只读)"""
+
+    __slots__ = ("tag_type", "name", "value", "element_type")
+
+    def __init__(self, tag_type, value=None, name="", element_type=None):
+        self.tag_type = tag_type
+        self.value = value
+        self.name = name
+        self.element_type = element_type
+
+
+class _NbtReader:
+    """读取大端 NBT 数据"""
+
+    def __init__(self, data):
+        self.data = data
+        self.size = len(data)
+        self.pos = 0
+
+    def read(self, length):
+        end = self.pos + length
+        if end > self.size:
+            raise ValueError("NBT 数据不完整")
+        chunk = self.data[self.pos:end]
+        self.pos = end
+        return chunk
+
+    def read_u8(self):
+        return self.read(1)[0]
+
+    def read_i8(self):
+        return struct.unpack(">b", self.read(1))[0]
+
+    def read_i16(self):
+        return struct.unpack(">h", self.read(2))[0]
+
+    def read_i32(self):
+        return struct.unpack(">i", self.read(4))[0]
+
+    def read_i64(self):
+        return struct.unpack(">q", self.read(8))[0]
+
+    def read_f32(self):
+        return struct.unpack(">f", self.read(4))[0]
+
+    def read_f64(self):
+        return struct.unpack(">d", self.read(8))[0]
+
+    def read_string(self):
+        length = struct.unpack(">H", self.read(2))[0]
+        return self.read(length).decode("utf-8", errors="replace")
+
+    def read_payload(self, tag_type, depth=0):
+        if depth > NBT_MAX_DEPTH:
+            raise ValueError("NBT 嵌套层数过多")
+        if tag_type == NBT_BYTE:
+            return NbtTag(tag_type, self.read_i8())
+        if tag_type == NBT_SHORT:
+            return NbtTag(tag_type, self.read_i16())
+        if tag_type == NBT_INT:
+            return NbtTag(tag_type, self.read_i32())
+        if tag_type == NBT_LONG:
+            return NbtTag(tag_type, self.read_i64())
+        if tag_type == NBT_FLOAT:
+            return NbtTag(tag_type, self.read_f32())
+        if tag_type == NBT_DOUBLE:
+            return NbtTag(tag_type, self.read_f64())
+        if tag_type == NBT_BYTE_ARRAY:
+            length = self.read_i32()
+            if length < 0 or length > NBT_MAX_ELEMENTS:
+                raise ValueError("Byte 数组长度异常")
+            return NbtTag(tag_type, self.read(length))
+        if tag_type == NBT_STRING:
+            return NbtTag(tag_type, self.read_string())
+        if tag_type == NBT_LIST:
+            element_type = self.read_u8()
+            length = self.read_i32()
+            if length < 0 or length > NBT_MAX_ELEMENTS:
+                raise ValueError("List 长度异常")
+            items = [
+                self.read_payload(element_type, depth + 1) for _ in range(length)
+            ]
+            return NbtTag(tag_type, items, element_type=element_type)
+        if tag_type == NBT_COMPOUND:
+            children = {}
+            while True:
+                child_type = self.read_u8()
+                if child_type == NBT_END:
+                    break
+                child_name = self.read_string()
+                child = self.read_payload(child_type, depth + 1)
+                child.name = child_name
+                children[child_name] = child
+            return NbtTag(tag_type, children)
+        if tag_type == NBT_INT_ARRAY:
+            length = self.read_i32()
+            if length < 0 or length > NBT_MAX_ELEMENTS:
+                raise ValueError("Int 数组长度异常")
+            raw = self.read(length * 4)
+            values = list(struct.unpack(">%di" % length, raw)) if length else []
+            return NbtTag(tag_type, values)
+        if tag_type == NBT_LONG_ARRAY:
+            length = self.read_i32()
+            if length < 0 or length > NBT_MAX_ELEMENTS:
+                raise ValueError("Long 数组长度异常")
+            raw = self.read(length * 8)
+            values = list(struct.unpack(">%dq" % length, raw)) if length else []
+            return NbtTag(tag_type, values)
+        raise ValueError(f"不支持的 NBT 类型: {tag_type}")
+
+
+def read_nbt_file(path):
+    """读取 .dat / .nbt 文件, 自动识别 gzip 压缩"""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:2] == b"\x1f\x8b":
+        try:
+            data = gzip.decompress(data)
+        except OSError as exp:
+            raise ValueError(f"gzip 解压失败: {exp}")
+    reader = _NbtReader(data)
+    tag_type = reader.read_u8()
+    if tag_type == NBT_END:
+        raise ValueError("文件里没有 NBT 数据")
+    name = reader.read_string()
+    root = reader.read_payload(tag_type)
+    root.name = name
+    return root
+
+
+def nbt_type_name(tag_type):
+    return NBT_TAG_NAMES.get(tag_type, f"TAG_{tag_type}")
+
+
+def nbt_type_label(tag):
+    if tag.tag_type == NBT_LIST and tag.element_type is not None:
+        return f"List<{nbt_type_name(tag.element_type)}>"
+    return nbt_type_name(tag.tag_type)
+
+
+def nbt_preview(text, limit=120):
+    text = " ".join(str(text).split())
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def nbt_summary(tag):
+    """返回树形列表里"值"一列显示的摘要"""
+    tag_type = tag.tag_type
+    value = tag.value
+    if tag_type in (NBT_BYTE, NBT_SHORT, NBT_INT, NBT_LONG):
+        return str(value)
+    if tag_type in (NBT_FLOAT, NBT_DOUBLE):
+        return f"{value:g}" if isinstance(value, float) else str(value)
+    if tag_type == NBT_STRING:
+        return '"' + nbt_preview(value) + '"'
+    if tag_type in (NBT_BYTE_ARRAY, NBT_INT_ARRAY, NBT_LONG_ARRAY):
+        return f"长度 {len(value)}"
+    if tag_type == NBT_LIST:
+        return f"{len(value)} 项"
+    if tag_type == NBT_COMPOUND:
+        return f"{len(value)} 个键"
+    return ""
+
+
 class Progressbar:
     def __init__(self, master, place_x, place_y, max_value, orient="vertical"):
         self.place_x = place_x
@@ -380,6 +586,9 @@ class MinecraftLauncher:
         self.progress_page_open = False
         self.download_page_open = False
         self.current_page = "main"
+        self.nbt_window = None
+        self._nbt_tags = {}
+        self._nbt_placeholders = set()
 
     def __init__(self):
         self._ui_queue = queue.Queue()
@@ -1129,6 +1338,12 @@ class MinecraftLauncher:
             command=self.delete_version,
         )
         self.DeleteVersionButton.place(x=430, y=10)
+        self.ViewNbtButton = tk.Button(
+            self.VerDescription,
+            text="查看NBT",
+            command=self.show_nbt_viewer,
+        )
+        self.ViewNbtButton.place(x=560, y=10)
         self.supply_mod_loading = tk.Label(self.VerDescription, text="支持mod加载:")
         self.supply_mod_loading.place(x=20, y=60)
         self.VersionListListBox.bind(
@@ -1966,6 +2181,169 @@ class MinecraftLauncher:
             )
         self.save_all()
         tkinter.messagebox.showinfo("完成", f"已删除版本:{version}")
+
+    def get_nbt_initial_dir(self):
+        """打开 NBT 文件时的默认目录(优先当前版本的存档)"""
+        if not self.minecraft_dir:
+            return os.getcwd()
+        version_saves = os.path.join(
+            self.minecraft_dir, "versions", str(self.selected_version), "saves"
+        )
+        save_selected = getattr(self, "save_selected", "")
+        if save_selected and save_selected not in (
+            "..返回上一级",
+            "重命名此版本",
+            "修改版本光影包...",
+            "修改版本资源包...",
+        ):
+            candidate = os.path.join(version_saves, save_selected)
+            if os.path.isdir(candidate):
+                return candidate
+        for candidate in (version_saves, os.path.join(self.minecraft_dir, "saves")):
+            if os.path.isdir(candidate):
+                return candidate
+        return self.minecraft_dir
+
+    def show_nbt_viewer(self):
+        """打开只读的 NBT 查看器"""
+        if getattr(self, "nbt_window", None) is not None:
+            try:
+                if self.nbt_window.winfo_exists():
+                    self.nbt_window.deiconify()
+                    self.nbt_window.lift()
+                    return
+            except tk.TclError:
+                pass
+        self.nbt_window = tk.Toplevel(self.main_win)
+        self.nbt_window.title("NBT 查看器")
+        self.nbt_window.geometry("960x620")
+        self.nbt_window.transient(self.main_win)
+        try:
+            self.nbt_window.iconbitmap("PML/ddd.ico")
+        except tk.TclError:
+            pass
+
+        top = tk.Frame(self.nbt_window)
+        top.pack(fill="x", padx=10, pady=8)
+        self.nbt_path_var = tk.StringVar(value="未打开文件")
+        tk.Label(top, textvariable=self.nbt_path_var, anchor="w").pack(
+            side="left", fill="x", expand=True
+        )
+        ttk.Button(top, text="全部折叠", command=self.collapse_nbt_tree).pack(
+            side="right", padx=(6, 0)
+        )
+        ttk.Button(top, text="打开文件...", command=self.open_nbt_file).pack(
+            side="right"
+        )
+
+        tree_frame = tk.Frame(self.nbt_window)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        self.nbt_tree = ttk.Treeview(
+            tree_frame, columns=("type", "value"), show="tree headings"
+        )
+        self.nbt_tree.heading("#0", text="名称 / 索引")
+        self.nbt_tree.heading("type", text="类型")
+        self.nbt_tree.heading("value", text="值")
+        self.nbt_tree.column("#0", width=300, anchor="w")
+        self.nbt_tree.column("type", width=110, anchor="w")
+        self.nbt_tree.column("value", width=500, anchor="w")
+        yscroll = ttk.Scrollbar(
+            tree_frame, orient="vertical", command=self.nbt_tree.yview
+        )
+        xscroll = ttk.Scrollbar(
+            tree_frame, orient="horizontal", command=self.nbt_tree.xview
+        )
+        self.nbt_tree.configure(
+            yscrollcommand=yscroll.set, xscrollcommand=xscroll.set
+        )
+        self.nbt_tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        self.nbt_tree.bind("<<TreeviewOpen>>", self.on_nbt_tree_open)
+
+        tk.Label(
+            self.nbt_window,
+            text="只读查看，不会修改文件。支持 .dat / .nbt，不支持 region(.mca) 文件。",
+            anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 8))
+        self.nbt_tree.delete(*self.nbt_tree.get_children(""))
+
+    def open_nbt_file(self, path=None):
+        """读取并显示一个 NBT 文件"""
+        if not path:
+            path = tkinter.filedialog.askopenfilename(
+                title="选择 NBT 文件",
+                initialdir=self.get_nbt_initial_dir(),
+                filetypes=[
+                    ("NBT 数据文件", "*.dat"),
+                    ("NBT 文件", "*.nbt"),
+                    ("所有文件", "*.*"),
+                ],
+            )
+        if not path:
+            return
+        try:
+            root = read_nbt_file(path)
+        except Exception as exp:
+            tkinter.messagebox.showerror(
+                "无法读取 NBT", f"{os.path.basename(path)}\n{exp}"
+            )
+            return
+        self._nbt_tags = {}
+        self._nbt_placeholders = set()
+        self.nbt_tree.delete(*self.nbt_tree.get_children(""))
+        self.nbt_path_var.set(path)
+        title = root.name or os.path.basename(path)
+        iid = self.nbt_tree.insert(
+            "",
+            "end",
+            text=title,
+            values=(nbt_type_label(root), nbt_summary(root)),
+            open=True,
+        )
+        self._nbt_tags[iid] = root
+        self.populate_nbt_children(iid, root)
+
+    def populate_nbt_children(self, parent, tag):
+        if tag.tag_type == NBT_COMPOUND:
+            for name, child in tag.value.items():
+                self.insert_nbt_row(parent, name, child)
+        elif tag.tag_type == NBT_LIST:
+            for index, child in enumerate(tag.value):
+                self.insert_nbt_row(parent, f"[{index}]", child)
+
+    def insert_nbt_row(self, parent, label, tag):
+        iid = self.nbt_tree.insert(
+            parent,
+            "end",
+            text=label,
+            values=(nbt_type_label(tag), nbt_summary(tag)),
+        )
+        self._nbt_tags[iid] = tag
+        if (tag.tag_type == NBT_COMPOUND and tag.value) or (
+            tag.tag_type == NBT_LIST and tag.value
+        ):
+            dummy = self.nbt_tree.insert(
+                iid, "end", text="正在加载...", values=("", "")
+            )
+            self._nbt_placeholders.add(dummy)
+
+    def on_nbt_tree_open(self, event=None):
+        iid = self.nbt_tree.focus()
+        tag = self._nbt_tags.get(iid)
+        if tag is None:
+            return
+        children = self.nbt_tree.get_children(iid)
+        if len(children) == 1 and children[0] in self._nbt_placeholders:
+            self._nbt_placeholders.discard(children[0])
+            self.nbt_tree.delete(children[0])
+            self.populate_nbt_children(iid, tag)
+
+    def collapse_nbt_tree(self):
+        for iid in self.nbt_tree.get_children(""):
+            self.nbt_tree.item(iid, open=False)
 
     def change_version_and_modify_version(self):
         self.set_current_page("modify")
