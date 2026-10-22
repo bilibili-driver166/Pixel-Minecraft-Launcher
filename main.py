@@ -69,11 +69,6 @@ ISOLATION_VALUES = ["不开启版本隔离", "隔离mod", "完全隔离"]
 _NOT_GIVEN = object()
 
 # 愚人节版本(不在 type 里体现, 需要单独列出来)
-# CurseForge API 镜像(MCIM): https://mod.mcimirror.top
-MCIM_CURSEFORGE_API = "https://mod.mcimirror.top/curseforge"
-MCIM_FILE_CDN = "https://mod.mcimirror.top"
-CURSEFORGE_LOADER_IDS = {"forge": 1, "fabric": 4, "quilt": 5, "neoforge": 6}
-
 APRIL_FOOLS_VERSIONS = {
     "2.0",
     "15w14a",
@@ -4968,7 +4963,7 @@ class MinecraftLauncher:
         if items:
             self.ModVersionCombobox.config(values=[item["id"] for item in items])
         self.ModStatusVar.set(
-            "来源：Modrinth 直连；CurseForge 走 MCIM 镜像（mod.mcimirror.top）。"
+            "来源：Modrinth 可直接搜索；CurseForge 需要 API Key，暂未接入。"
         )
         self.ModInfoLabel.config(text="")
         self.ModInstallButton.config(state="disabled")
@@ -5048,6 +5043,13 @@ class MinecraftLauncher:
             tkinter.messagebox.showinfo("提示", "请输入至少 2 个字符的模组名称。")
             return
         source = self.ModSourceVar.get()
+        if source == "CurseForge":
+            tkinter.messagebox.showinfo(
+                "CurseForge",
+                "CurseForge 官方 API 需要 API Key，目前还没有接入。\n"
+                "请先选择 Modrinth 或「全部」（只搜索 Modrinth）。",
+            )
+            return
         mc_version = (
             self.ModVersionVar.get().strip() or self.get_selected_base_version()
         )
@@ -5057,23 +5059,12 @@ class MinecraftLauncher:
         self.ModInfoLabel.config(text="")
 
         def worker():
-            results = []
-            errors = []
-            if source in ("全部", "Modrinth"):
-                try:
-                    results.extend(
-                        self.fetch_modrinth_mods(name, mc_version, loader)
-                    )
-                except Exception as exp:
-                    errors.append(f"Modrinth: {exp}")
-            if source in ("全部", "CurseForge"):
-                try:
-                    results.extend(
-                        self.fetch_curseforge_mods(name, mc_version, loader)
-                    )
-                except Exception as exp:
-                    errors.append(f"CurseForge: {exp}")
-            self.ui_call(self.populate_mod_results, results, source, errors)
+            try:
+                results = self.fetch_modrinth_mods(name, mc_version, loader)
+            except Exception as exp:
+                self.ui_call(self.ModStatusVar.set, f"搜索失败: {exp}")
+                return
+            self.ui_call(self.populate_mod_results, results, source)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -5110,76 +5101,21 @@ class MinecraftLauncher:
             )
         return results
 
-    def fetch_curseforge_mods(self, name, mc_version, loader):
-        params = {
-            "gameId": 432,
-            "classId": 6,
-            "searchFilter": name,
-            "gameVersion": mc_version,
-            "pageSize": 20,
-            "index": 0,
-        }
-        loader_id = CURSEFORGE_LOADER_IDS.get(loader)
-        if loader_id:
-            params["modLoaderType"] = loader_id
-        url = (
-            MCIM_CURSEFORGE_API
-            + "/v1/mods/search?"
-            + urllib.parse.urlencode(params)
-        )
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "PixelMinecraftLauncher/4.4",
-                "Accept": "application/json",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=25) as response:
-            data = json.load(response)
-        results = []
-        for mod in data.get("data", []):
-            authors = mod.get("authors") or []
-            author = ""
-            if authors:
-                author = str(authors[0].get("name", ""))
-            results.append(
-                {
-                    "project_id": mod.get("id"),
-                    "slug": mod.get("slug"),
-                    "title": mod.get("name") or mod.get("slug") or "",
-                    "description": mod.get("summary") or "",
-                    "author": author,
-                    "downloads": mod.get("downloadCount"),
-                    "source": "CurseForge",
-                }
-            )
-        return results
-
-    def populate_mod_results(self, results, source, errors=None):
-        errors = errors or []
-        results.sort(key=lambda item: item.get("downloads") or 0, reverse=True)
+    def populate_mod_results(self, results, source):
         self.mod_search_results = results
         self.mod_selected_result = None
         self.mod_results_listbox.delete(0, tk.END)
         if not results:
             self.mod_results_listbox.insert(tk.END, "没有找到匹配的模组")
-            message = "没有找到匹配的模组，换个关键词或版本试试。"
-            if errors:
-                message += " " + "；".join(errors)
-            self.ModStatusVar.set(message)
+            self.ModStatusVar.set("没有找到匹配的模组，换个关键词或版本试试。")
             return
         for result in results:
-            tag = "CF" if result.get("source") == "CurseForge" else "MR"
-            self.mod_results_listbox.insert(
-                tk.END, f"[{tag}] {result.get('title', '')}"
-            )
+            self.mod_results_listbox.insert(tk.END, result["title"])
         self.mod_results_listbox.bind("<<ListboxSelect>>", self.on_mod_select)
-        note = f"找到 {len(results)} 个结果，点左侧选择后安装。"
-        if source == "全部":
-            note += "（Modrinth + CurseForge/MCIM）"
-        if errors:
-            note += " " + "；".join(errors)
-        self.ModStatusVar.set(note)
+        note = "（CurseForge 暂未接入）" if source == "全部" else ""
+        self.ModStatusVar.set(
+            f"找到 {len(results)} 个结果，点左侧选择后安装。{note}"
+        )
 
     def install_selected_mod(self):
         result = self.mod_selected_result
@@ -5201,14 +5137,9 @@ class MinecraftLauncher:
 
         def worker():
             try:
-                if result.get("source") == "CurseForge":
-                    url, filename = self.resolve_curseforge_file(
-                        result["project_id"], mc_version, loader
-                    )
-                else:
-                    url, filename = self.resolve_modrinth_file(
-                        result["project_id"], mc_version, loader
-                    )
+                url, filename = self.resolve_modrinth_file(
+                    result["project_id"], mc_version, loader
+                )
                 self.ui_call(self.ModStatusVar.set, f"正在下载 {filename} ...")
                 target = self.download_mod_file(url, filename)
             except Exception as exp:
@@ -5251,49 +5182,6 @@ class MinecraftLauncher:
         if primary is None:
             primary = files[0]
         return primary["url"], primary.get("filename") or "mod.jar"
-
-    def resolve_curseforge_file(self, mod_id, mc_version, loader):
-        params = {"gameVersion": mc_version, "pageSize": 1, "index": 0}
-        loader_id = CURSEFORGE_LOADER_IDS.get(loader)
-        if loader_id:
-            params["modLoaderType"] = loader_id
-        url = (
-            f"{MCIM_CURSEFORGE_API}/v1/mods/{mod_id}/files?"
-            + urllib.parse.urlencode(params)
-        )
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "PixelMinecraftLauncher/4.4",
-                "Accept": "application/json",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=25) as response:
-            data = json.load(response)
-        files = data.get("data") or []
-        if not files:
-            raise ValueError("没有找到适配当前版本和加载器的文件")
-        file = files[0]
-        filename = file.get("fileName") or "mod.jar"
-        download_url = file.get("downloadUrl")
-        if download_url:
-            download_url = self.mirror_forgecdn_url(download_url)
-        else:
-            file_id = int(file.get("id") or 0)
-            download_url = (
-                f"{MCIM_FILE_CDN}/files/{file_id // 1000}/{file_id % 1000}/"
-                + urllib.parse.quote(filename)
-            )
-        return download_url, filename
-
-    def mirror_forgecdn_url(self, url):
-        for prefix in (
-            "https://edge.forgecdn.net",
-            "https://mediafilez.forgecdn.net",
-        ):
-            if url.startswith(prefix):
-                return MCIM_FILE_CDN + url[len(prefix) :]
-        return url
 
     def download_mod_file(self, url, filename):
         mods_dir = os.path.join(

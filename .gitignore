@@ -23,3 +23,5 @@ versions/
 
 # ---- 旧版本源码(仓库只维护根目录 main.py) ----
 source code/
+hs_err_pid*.log
+replay_pid*.log
