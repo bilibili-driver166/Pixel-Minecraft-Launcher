@@ -374,7 +374,6 @@ class MinecraftLauncher:
         self.support_forge = ""
         self.game_processes = []
         self.current_progress = 0
-        self.progress_window = None
         self.downloading = False
         self.close_button_visible = False
 
@@ -1142,6 +1141,52 @@ class MinecraftLauncher:
         self.ModListListBox = tk.Listbox(self.VerDescription, width=50, height=19)
         self.ModListListBox.place(x=36, y=100)
 
+        # ---- 下载进度页(和下载页一样是独立页面) ----
+        self.Menu_Butt_progress = tk.Button(
+            self.main_win, text="🏠", command=self.from_progress_to_download_page
+        )
+        self.Menu_Butt_progress.place(x=-50, y=5)
+        self.ProgressDescription = ttk.Frame(
+            self.main_win, width=750, height=454, relief="ridge"
+        )
+        self.ProgressDescription.place(x=1350, y=5)
+        self.ProgressDescriptionLabel = tk.Label(
+            self.ProgressDescription, text="下载进度", font=("等线", 25)
+        )
+        self.ProgressDescriptionLabel.place(x=20, y=0)
+        self.progress_version_var = tk.StringVar(value="")
+        self.progress_status_var = tk.StringVar(value="准备中...")
+        self.progress_percent_var = tk.StringVar(value="")
+        self.progress_value_var = tk.DoubleVar(value=0)
+        self.ProgressVersionLabel = tk.Label(
+            self.ProgressDescription, textvariable=self.progress_version_var
+        )
+        self.ProgressVersionLabel.place(x=20, y=60)
+        self.ProgressStatusLabel = tk.Label(
+            self.ProgressDescription,
+            textvariable=self.progress_status_var,
+            anchor="w",
+            justify="left",
+            wraplength=680,
+        )
+        self.ProgressStatusLabel.place(x=20, y=100)
+        self.progress_bar = ttk.Progressbar(
+            self.ProgressDescription,
+            length=680,
+            maximum=100,
+            variable=self.progress_value_var,
+        )
+        self.progress_bar.place(x=20, y=145)
+        self.ProgressPercentLabel = tk.Label(
+            self.ProgressDescription, textvariable=self.progress_percent_var
+        )
+        self.ProgressPercentLabel.place(x=20, y=175)
+        self.ProgressHintLabel = tk.Label(
+            self.ProgressDescription,
+            text="下载期间可以点左上角 🏠 返回下载页面，下载会在后台继续。",
+        )
+        self.ProgressHintLabel.place(x=20, y=215)
+
     def add_java(self):
         javawplace = tkinter.filedialog.askopenfilename(
             title="打开Java解释器位置", filetypes=[("Java解释器", "javaw.exe")]
@@ -1855,7 +1900,7 @@ class MinecraftLauncher:
         mod_loader = self.ModLoader.get()
         loader_version = (self.ModLoaderVersion.get() or "").strip()
         java_path = self.get_launch_java()
-        self.start_download_ui()
+        self.start_download_ui(version, mod_loader)
         threading.Thread(
             target=self.download_version,
             args=(version, mod_loader, loader_version, java_path),
@@ -2352,12 +2397,16 @@ class MinecraftLauncher:
             self.current_max = 0
         self.ui_call(self.update_progress_ui)
 
-    def start_download_ui(self):
+    def start_download_ui(self, version="", mod_loader=""):
         """开始下载时重置进度并显示"查看下载进度"按钮"""
         self.downloading = True
         self.status = "正在准备下载..."
         self.current_progress = 0
         self.current_max = 0
+        if version:
+            self.progress_version_var.set(f"版本: {version}（{mod_loader}）")
+        else:
+            self.progress_version_var.set("")
         self.DownloadButton.config(state=tk.DISABLED)
         if not self.progress_button_visible:
             self.ProgressButton.place(x=260, y=150)
@@ -2369,75 +2418,77 @@ class MinecraftLauncher:
         self.DownloadButton.config(state=tk.NORMAL)
         self.status = "下载完成" if success else "下载失败"
         self.update_progress_ui()
-        # 如果进度窗口开着(或被隐藏了), 把结果显示出来
-        if self.progress_window_exists():
-            try:
-                self.progress_window.deiconify()
-                self.progress_window.lift()
-            except tk.TclError:
-                pass
 
-    def progress_window_exists(self):
-        try:
-            return bool(
-                self.progress_window and self.progress_window.winfo_exists()
-            )
-        except tk.TclError:
-            return False
+    def create_progress_page(self):
+        """滑入下载进度页"""
+        animation.MoveTkWidget(
+            self.Menu_Butt_progress,
+            (50, 0),
+            500,
+            fps=60,
+            controller=animation.smooth,
+        ).start()
+        animation.MoveTkWidget(
+            self.ProgressDescription,
+            (-1000, 0),
+            500,
+            fps=60,
+            controller=animation.smooth,
+        ).start()
 
-    def create_progress_window(self):
-        self.progress_window = tk.Toplevel(self.main_win)
-        self.progress_window.title("下载进度")
-        self.progress_window.geometry("460x150")
-        self.progress_window.resizable(False, False)
-        self.progress_window.transient(self.main_win)
-        self.progress_window.protocol(
-            "WM_DELETE_WINDOW", self.progress_window.withdraw
-        )
-        self.progress_status_var = tk.StringVar(value="准备中...")
-        self.progress_percent_var = tk.StringVar(value="")
-        self.progress_value_var = tk.DoubleVar(value=0)
-        tk.Label(
-            self.progress_window,
-            textvariable=self.progress_status_var,
-            anchor="w",
-            justify="left",
-            wraplength=420,
-        ).place(x=20, y=15)
-        self.progress_bar = ttk.Progressbar(
-            self.progress_window,
-            length=420,
-            maximum=100,
-            variable=self.progress_value_var,
-        )
-        self.progress_bar.place(x=20, y=60)
-        tk.Label(
-            self.progress_window, textvariable=self.progress_percent_var
-        ).place(x=20, y=88)
-        ttk.Button(
-            self.progress_window,
-            text="隐藏",
-            command=self.progress_window.withdraw,
-        ).place(x=380, y=112)
-        self.progress_window.update_idletasks()
-        x = self.main_win.winfo_rootx() + (self.main_win.winfo_width() - 460) // 2
-        y = self.main_win.winfo_rooty() + (self.main_win.winfo_height() - 150) // 2
-        self.progress_window.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    def delete_progress_page(self):
+        """滑出下载进度页"""
+        animation.MoveTkWidget(
+            self.Menu_Butt_progress,
+            (-50, 0),
+            500,
+            fps=60,
+            controller=animation.smooth,
+        ).start()
+        animation.MoveTkWidget(
+            self.ProgressDescription,
+            (1000, 0),
+            500,
+            fps=60,
+            controller=animation.smooth,
+        ).start()
 
-    def show_download_progress(self):
-        """显示下载进度窗口"""
-        if not self.progress_window_exists():
-            self.create_progress_window()
-        try:
-            self.progress_window.deiconify()
-            self.progress_window.lift()
-        except tk.TclError:
-            self.create_progress_window()
+    def from_download_to_progress_page(self):
+        """从下载页切换到下载进度页"""
+        animation.MoveTkWidget(
+            self.Menu_Butt_download,
+            (-50, 0),
+            500,
+            fps=60,
+            controller=animation.smooth,
+        ).start()
+        animation.MoveTkWidget(
+            self.version_listbox,
+            (0, -500),
+            500,
+            fps=60,
+            controller=animation.smooth,
+        ).start()
+        animation.MoveTkWidget(
+            self.VersionDescription,
+            (1000, 0),
+            500,
+            fps=60,
+            controller=animation.smooth,
+        ).start()
+        self.create_progress_page()
         self.update_progress_ui()
 
+    def from_progress_to_download_page(self):
+        """从下载进度页返回下载页"""
+        self.delete_progress_page()
+        self.create_download()
+
+    def show_download_progress(self):
+        """查看下载进度(切换到下载进度页)"""
+        self.from_download_to_progress_page()
+
     def update_progress_ui(self):
-        if not self.progress_window_exists():
-            return
         maximum = self.current_max or 0
         value = self.current_progress or 0
         if maximum > 0:
