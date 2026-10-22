@@ -589,6 +589,7 @@ class MinecraftLauncher:
         self.nbt_window = None
         self._nbt_tags = {}
         self._nbt_placeholders = set()
+        self._nbt_last_dir = ""
 
     def __init__(self):
         self._ui_queue = queue.Queue()
@@ -1197,6 +1198,16 @@ class MinecraftLauncher:
             self.PML_Setting_Frame, text="手动添加Java", command=self.add_java
         )
         self.Java_add_butt.place(x=575, y=146)
+        self.NbtViewerLabel = tk.Label(
+            self.PML_Setting_Frame, text="NBT 文件查看:", font=("等线", 13)
+        )
+        self.NbtViewerLabel.place(x=720, y=0)
+        self.ViewNbtButton = tk.Button(
+            self.PML_Setting_Frame,
+            text="打开 NBT 查看器",
+            command=self.show_nbt_viewer,
+        )
+        self.ViewNbtButton.place(x=720, y=28)
 
         self.Menu_Butt_User = tk.Button(
             self.main_win, text="🏠", command=self.delete_settings
@@ -1350,12 +1361,6 @@ class MinecraftLauncher:
             command=self.delete_version,
         )
         self.DeleteVersionButton.place(x=430, y=10)
-        self.ViewNbtButton = tk.Button(
-            self.VerDescription,
-            text="查看NBT",
-            command=self.show_nbt_viewer,
-        )
-        self.ViewNbtButton.place(x=560, y=10)
         self.supply_mod_loading = tk.Label(self.VerDescription, text="支持mod加载:")
         self.supply_mod_loading.place(x=20, y=60)
         self.VersionListListBox.bind(
@@ -2195,23 +2200,18 @@ class MinecraftLauncher:
         tkinter.messagebox.showinfo("完成", f"已删除版本:{version}")
 
     def get_nbt_initial_dir(self):
-        """打开 NBT 文件时的默认目录(优先当前版本的存档)"""
+        """打开 NBT 文件时的默认目录: 上次目录 -> 全局 saves -> 当前版本 saves"""
+        last_dir = getattr(self, "_nbt_last_dir", "")
+        if last_dir and os.path.isdir(last_dir):
+            return last_dir
         if not self.minecraft_dir:
             return os.getcwd()
-        version_saves = os.path.join(
-            self.minecraft_dir, "versions", str(self.selected_version), "saves"
-        )
-        save_selected = getattr(self, "save_selected", "")
-        if save_selected and save_selected not in (
-            "..返回上一级",
-            "重命名此版本",
-            "修改版本光影包...",
-            "修改版本资源包...",
+        for candidate in (
+            os.path.join(self.minecraft_dir, "saves"),
+            os.path.join(
+                self.minecraft_dir, "versions", str(self.selected_version), "saves"
+            ),
         ):
-            candidate = os.path.join(version_saves, save_selected)
-            if os.path.isdir(candidate):
-                return candidate
-        for candidate in (version_saves, os.path.join(self.minecraft_dir, "saves")):
             if os.path.isdir(candidate):
                 return candidate
         return self.minecraft_dir
@@ -2309,6 +2309,7 @@ class MinecraftLauncher:
             return
         self._nbt_tags = {}
         self._nbt_placeholders = set()
+        self._nbt_last_dir = os.path.dirname(os.path.abspath(path))
         self.nbt_tree.delete(*self.nbt_tree.get_children(""))
         self.nbt_path_var.set(path)
         title = root.name or os.path.basename(path)
