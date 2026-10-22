@@ -924,7 +924,19 @@ class MinecraftLauncher:
     def set_alpha(self, value):
         self.main_win.alpha(self.scale.get() / 100)
         self.alpha = self.scale.get() / 100
+        self.apply_window_alpha()
         self.save_all()
+
+    def apply_window_alpha(self):
+        """把透明度同步到 NBT 查看器等子窗口"""
+        window = getattr(self, "nbt_window", None)
+        if window is None:
+            return
+        try:
+            if window.winfo_exists():
+                window.attributes("-alpha", self.alpha)
+        except (tk.TclError, AttributeError):
+            pass
 
     def fetch_version_list_from_mirror(self):
         """从 BMCLAPI 镜像获取 Minecraft 版本列表"""
@@ -2218,6 +2230,10 @@ class MinecraftLauncher:
         self.nbt_window.title("NBT 查看器")
         self.nbt_window.geometry("960x620")
         self.nbt_window.transient(self.main_win)
+        try:
+            self.nbt_window.attributes("-alpha", self.alpha)
+        except tk.TclError:
+            pass
         try:
             self.nbt_window.iconbitmap("PML/ddd.ico")
         except tk.TclError:
