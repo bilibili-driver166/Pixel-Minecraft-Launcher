@@ -68,12 +68,6 @@ ISOLATION_FULL = 2
 ISOLATION_VALUES = ["不开启版本隔离", "隔离mod", "完全隔离"]
 _NOT_GIVEN = object()
 
-# CurseForge 官方 API Key(申请: https://console.curseforge.com/)
-# 直接填在下面即可, 不需要用户输入; 注意公开仓库提交前请确认是否要暴露
-CURSEFORGE_API_KEY = ""
-CURSEFORGE_API_BASE = "https://api.curseforge.com"
-CURSEFORGE_LOADER_IDS = {"forge": 1, "fabric": 4, "quilt": 5, "neoforge": 6}
-
 # 愚人节版本(不在 type 里体现, 需要单独列出来)
 APRIL_FOOLS_VERSIONS = {
     "2.0",
@@ -1647,7 +1641,6 @@ class MinecraftLauncher:
         # ---- 模组下载 ----
         self.ModNameVar = tk.StringVar()
         self.ModVersionVar = tk.StringVar()
-        self.ModSourceVar = tk.StringVar(value="全部")
         self.ModStatusVar = tk.StringVar(value="")
         self.mod_search_results = []
         self.mod_selected_result = None
@@ -1668,15 +1661,6 @@ class MinecraftLauncher:
             self.ModPanel, textvariable=self.ModVersionVar, width=12
         )
         self.ModVersionCombobox.place(x=100, y=43)
-        tk.Label(self.ModPanel, text="来源:").place(x=300, y=45)
-        self.ModSourceCombobox = ttk.Combobox(
-            self.ModPanel,
-            textvariable=self.ModSourceVar,
-            values=["全部", "Modrinth", "CurseForge"],
-            state="readonly",
-            width=14,
-        )
-        self.ModSourceCombobox.place(x=350, y=43)
         tk.Label(
             self.ModPanel,
             textvariable=self.ModStatusVar,
@@ -4968,13 +4952,7 @@ class MinecraftLauncher:
         items = getattr(self, "version_list_items", None) or []
         if items:
             self.ModVersionCombobox.config(values=[item["id"] for item in items])
-        if CURSEFORGE_API_KEY.strip():
-            self.ModStatusVar.set("来源：Modrinth + CurseForge 可用。")
-        else:
-            self.ModStatusVar.set(
-                "来源：Modrinth 可用；CurseForge 未配置 API Key"
-                "（main.py 顶部 CURSEFORGE_API_KEY）。"
-            )
+        self.ModStatusVar.set("来源：Modrinth。")
         self.ModInfoLabel.config(text="")
         self.ModInstallButton.config(state="disabled")
         self.mod_search_results = []
@@ -5052,15 +5030,6 @@ class MinecraftLauncher:
         if len(name) < 2:
             tkinter.messagebox.showinfo("提示", "请输入至少 2 个字符的模组名称。")
             return
-        source = self.ModSourceVar.get()
-        curseforge_enabled = bool(CURSEFORGE_API_KEY.strip())
-        if source == "CurseForge" and not curseforge_enabled:
-            tkinter.messagebox.showinfo(
-                "CurseForge",
-                "还没有填写 CurseForge API Key。\n"
-                "请打开 main.py，在顶部的 CURSEFORGE_API_KEY 里填上 Key。",
-            )
-            return
         mc_version = (
             self.ModVersionVar.get().strip() or self.get_selected_base_version()
         )
@@ -5070,29 +5039,12 @@ class MinecraftLauncher:
         self.ModInfoLabel.config(text="")
 
         def worker():
-            results = []
-            errors = []
-            if source in ("全部", "Modrinth"):
-                try:
-                    results.extend(
-                        self.fetch_modrinth_mods(name, mc_version, loader)
-                    )
-                except Exception as exp:
-                    errors.append(f"Modrinth: {exp}")
-            if source in ("全部", "CurseForge") and curseforge_enabled:
-                try:
-                    results.extend(
-                        self.fetch_curseforge_mods(name, mc_version, loader)
-                    )
-                except Exception as exp:
-                    errors.append(f"CurseForge: {exp}")
-            self.ui_call(
-                self.populate_mod_results,
-                results,
-                source,
-                errors,
-                curseforge_enabled,
-            )
+            try:
+                results = self.fetch_modrinth_mods(name, mc_version, loader)
+            except Exception as exp:
+                self.ui_call(self.ModStatusVar.set, f"搜索失败: {exp}")
+                return
+            self.ui_call(self.populate_mod_results, results)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -5129,90 +5081,19 @@ class MinecraftLauncher:
             )
         return results
 
-    def fetch_curseforge_mods(self, name, mc_version, loader):
-        api_key = CURSEFORGE_API_KEY.strip()
-        if not api_key:
-            raise ValueError("未配置 CurseForge API Key")
-        params = {
-            "gameId": 432,
-            "classId": 6,
-            "searchFilter": name,
-            "gameVersion": mc_version,
-            "pageSize": 20,
-            "index": 0,
-        }
-        loader_id = CURSEFORGE_LOADER_IDS.get(loader)
-        if loader_id:
-            params["modLoaderType"] = loader_id
-        url = (
-            CURSEFORGE_API_BASE
-            + "/v1/mods/search?"
-            + urllib.parse.urlencode(params)
-        )
-        request = urllib.request.Request(
-            url,
-            headers={
-                "x-api-key": api_key,
-                "Accept": "application/json",
-                "User-Agent": "PixelMinecraftLauncher/4.4",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=25) as response:
-            data = json.load(response)
-        results = []
-        for mod in data.get("data", []):
-            authors = mod.get("authors") or []
-            author = ""
-            if authors:
-                author = str(authors[0].get("name", ""))
-            results.append(
-                {
-                    "project_id": mod.get("id"),
-                    "slug": mod.get("slug"),
-                    "title": mod.get("name") or mod.get("slug") or "",
-                    "description": mod.get("summary") or "",
-                    "author": author,
-                    "downloads": mod.get("downloadCount"),
-                    "source": "CurseForge",
-                }
-            )
-        return results
-
-    def populate_mod_results(
-        self, results, source, errors=None, curseforge_enabled=False
-    ):
-        errors = errors or []
-        if source == "全部":
-            results.sort(key=lambda item: item.get("downloads") or 0, reverse=True)
+    def populate_mod_results(self, results):
         self.mod_search_results = results
         self.mod_selected_result = None
         self.mod_results_listbox.delete(0, tk.END)
         if not results:
             self.mod_results_listbox.insert(tk.END, "没有找到匹配的模组")
-            message = "没有找到匹配的模组，换个关键词或版本试试。"
-            if errors:
-                message += " " + "；".join(errors)
-            self.ModStatusVar.set(message)
+            self.ModStatusVar.set("没有找到匹配的模组，换个关键词或版本试试。")
             return
         for result in results:
-            if source == "全部":
-                tag = "CF" if result.get("source") == "CurseForge" else "MR"
-                label = f"[{tag}] {result.get('title', '')}"
-            else:
-                label = result.get("title", "")
-            self.mod_results_listbox.insert(tk.END, label)
+            self.mod_results_listbox.insert(tk.END, result["title"])
         self.mod_results_listbox.bind("<<ListboxSelect>>", self.on_mod_select)
-        note = ""
-        if source == "全部":
-            note = (
-                "（Modrinth + CurseForge）"
-                if curseforge_enabled
-                else "（CurseForge 未配置 API Key）"
-            )
-        if errors:
-            note += " " + "；".join(errors)
         self.ModStatusVar.set(
-            f"找到 {len(results)} 个结果，点左侧选择后安装。{note}"
+            f"找到 {len(results)} 个结果，点左侧选择后安装。"
         )
 
     def install_selected_mod(self):
@@ -5235,14 +5116,9 @@ class MinecraftLauncher:
 
         def worker():
             try:
-                if result.get("source") == "CurseForge":
-                    url, filename = self.resolve_curseforge_file(
-                        result["project_id"], mc_version, loader
-                    )
-                else:
-                    url, filename = self.resolve_modrinth_file(
-                        result["project_id"], mc_version, loader
-                    )
+                url, filename = self.resolve_modrinth_file(
+                    result["project_id"], mc_version, loader
+                )
                 self.ui_call(self.ModStatusVar.set, f"正在下载 {filename} ...")
                 target = self.download_mod_file(url, filename)
             except Exception as exp:
@@ -5285,42 +5161,6 @@ class MinecraftLauncher:
         if primary is None:
             primary = files[0]
         return primary["url"], primary.get("filename") or "mod.jar"
-
-    def resolve_curseforge_file(self, mod_id, mc_version, loader):
-        api_key = CURSEFORGE_API_KEY.strip()
-        if not api_key:
-            raise ValueError("未配置 CurseForge API Key")
-        params = {"gameVersion": mc_version, "pageSize": 1, "index": 0}
-        loader_id = CURSEFORGE_LOADER_IDS.get(loader)
-        if loader_id:
-            params["modLoaderType"] = loader_id
-        url = (
-            f"{CURSEFORGE_API_BASE}/v1/mods/{mod_id}/files?"
-            + urllib.parse.urlencode(params)
-        )
-        request = urllib.request.Request(
-            url,
-            headers={
-                "x-api-key": api_key,
-                "Accept": "application/json",
-                "User-Agent": "PixelMinecraftLauncher/4.4",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=25) as response:
-            data = json.load(response)
-        files = data.get("data") or []
-        if not files:
-            raise ValueError("没有找到适配当前版本和加载器的文件")
-        file = files[0]
-        filename = file.get("fileName") or "mod.jar"
-        download_url = file.get("downloadUrl")
-        if not download_url:
-            file_id = int(file.get("id") or 0)
-            download_url = (
-                f"https://edge.forgecdn.net/files/{file_id // 1000}/"
-                f"{file_id % 1000}/" + urllib.parse.quote(filename)
-            )
-        return download_url, filename
 
     def download_mod_file(self, url, filename):
         mods_dir = os.path.join(
