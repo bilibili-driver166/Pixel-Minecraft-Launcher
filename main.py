@@ -15,6 +15,7 @@ import re
 import struct
 import urllib.request
 import uuid
+import zipfile
 import maliang.animation as animation
 import tkinter.messagebox as messagebox
 import tkinter.colorchooser
@@ -377,11 +378,12 @@ class _NbtReader:
         raise ValueError(f"不支持的 NBT 类型: {tag_type}")
 
 
-def read_nbt_file(path):
-    """读取 .dat / .nbt 文件, 自动识别 gzip 压缩"""
+def load_nbt_document(path):
+    """读取 .dat / .nbt 文件, 返回 (root, 是否 gzip 压缩)"""
     with open(path, "rb") as f:
         data = f.read()
-    if data[:2] == b"\x1f\x8b":
+    compressed = data[:2] == b"\x1f\x8b"
+    if compressed:
         try:
             data = gzip.decompress(data)
         except OSError as exp:
@@ -393,7 +395,159 @@ def read_nbt_file(path):
     name = reader.read_string()
     root = reader.read_payload(tag_type)
     root.name = name
-    return root
+    return root, compressed
+
+
+def read_nbt_file(path):
+    """读取 .dat / .nbt 文件, 自动识别 gzip 压缩"""
+    return load_nbt_document(path)[0]
+
+
+def encode_nbt_string(text):
+    data = str(text).encode("utf-8")
+    if len(data) > 0xFFFF:
+        raise ValueError("字符串超过 65535 字节")
+    return struct.pack(">H", len(data)) + data
+
+
+def encode_nbt_payload(tag):
+    tag_type = tag.tag_type
+    value = tag.value
+    if tag_type == NBT_BYTE:
+        return struct.pack(">b", int(value))
+    if tag_type == NBT_SHORT:
+        return struct.pack(">h", int(value))
+    if tag_type == NBT_INT:
+        return struct.pack(">i", int(value))
+    if tag_type == NBT_LONG:
+        return struct.pack(">q", int(value))
+    if tag_type == NBT_FLOAT:
+        return struct.pack(">f", float(value))
+    if tag_type == NBT_DOUBLE:
+        return struct.pack(">d", float(value))
+    if tag_type == NBT_BYTE_ARRAY:
+        raw = bytes(value)
+        return struct.pack(">i", len(raw)) + raw
+    if tag_type == NBT_STRING:
+        return encode_nbt_string(value)
+    if tag_type == NBT_INT_ARRAY:
+        values = [int(i) for i in value]
+        return struct.pack(">i", len(values)) + b"".join(
+            struct.pack(">i", i) for i in values
+        )
+    if tag_type == NBT_LONG_ARRAY:
+        values = [int(i) for i in value]
+        return struct.pack(">i", len(values)) + b"".join(
+            struct.pack(">q", i) for i in values
+        )
+    if tag_type == NBT_LIST:
+        element_type = tag.element_type
+        if element_type is None and value:
+            element_type = value[0].tag_type
+        if element_type is None:
+            element_type = NBT_END
+        return (
+            struct.pack(">b", element_type)
+            + struct.pack(">i", len(value))
+            + b"".join(encode_nbt_payload(item) for item in value)
+        )
+    if tag_type == NBT_COMPOUND:
+        parts = []
+        for name, child in value.items():
+            parts.append(struct.pack(">b", child.tag_type))
+            parts.append(encode_nbt_string(name))
+            parts.append(encode_nbt_payload(child))
+        return b"".join(parts) + b"\x00"
+    raise ValueError(f"无法写入 NBT 类型: {tag_type}")
+
+
+def encode_nbt_document(root):
+    return (
+        struct.pack(">b", root.tag_type)
+        + encode_nbt_string(root.name)
+        + encode_nbt_payload(root)
+    )
+
+
+def save_nbt_document(path, root, compressed=False):
+    """写回 NBT: 先备份 .bak, 写临时文件后再原子替换"""
+    data = encode_nbt_document(root)
+    if compressed:
+        data = gzip.compress(data)
+    temp_path = path + ".tmp"
+    with open(temp_path, "wb") as f:
+        f.write(data)
+    if os.path.isfile(path):
+        shutil.copy2(path, path + ".bak")
+    os.replace(temp_path, path)
+
+
+NBT_EDITABLE_TYPES = (
+    NBT_BYTE,
+    NBT_SHORT,
+    NBT_INT,
+    NBT_LONG,
+    NBT_FLOAT,
+    NBT_DOUBLE,
+    NBT_STRING,
+)
+
+NBT_EDITABLE_NAME_TO_TYPE = {
+    "Byte": NBT_BYTE,
+    "Short": NBT_SHORT,
+    "Int": NBT_INT,
+    "Long": NBT_LONG,
+    "Float": NBT_FLOAT,
+    "Double": NBT_DOUBLE,
+    "String": NBT_STRING,
+}
+
+
+def parse_nbt_value(tag_type, raw):
+    """把用户输入转换成对应 NBT 类型的值"""
+    if tag_type == NBT_STRING:
+        return raw
+    text = raw.strip()
+    if tag_type in (NBT_FLOAT, NBT_DOUBLE):
+        try:
+            return float(text)
+        except ValueError:
+            raise ValueError("请输入一个有效的数字")
+    if tag_type == NBT_BYTE:
+        low, high = -128, 127
+    elif tag_type == NBT_SHORT:
+        low, high = -32768, 32767
+    elif tag_type == NBT_INT:
+        low, high = -(2**31), 2**31 - 1
+    elif tag_type == NBT_LONG:
+        low, high = -(2**63), 2**63 - 1
+    else:
+        raise ValueError("这个类型暂不支持编辑")
+    try:
+        value = int(text)
+    except ValueError:
+        raise ValueError("请输入一个有效的整数")
+    if not low <= value <= high:
+        raise ValueError(f"数值超出范围（{low} ~ {high}）")
+    return value
+
+
+def default_nbt_value(tag_type):
+    if tag_type in (NBT_BYTE, NBT_SHORT, NBT_INT, NBT_LONG):
+        return 0
+    if tag_type in (NBT_FLOAT, NBT_DOUBLE):
+        return 0.0
+    if tag_type == NBT_STRING:
+        return ""
+    if tag_type == NBT_BYTE_ARRAY:
+        return b""
+    if tag_type in (NBT_INT_ARRAY, NBT_LONG_ARRAY):
+        return []
+    if tag_type == NBT_COMPOUND:
+        return {}
+    if tag_type == NBT_LIST:
+        return []
+    return None
 
 
 def nbt_type_name(tag_type):
@@ -590,6 +744,16 @@ class MinecraftLauncher:
         self._nbt_tags = {}
         self._nbt_placeholders = set()
         self._nbt_last_dir = ""
+        self.nbt_root = None
+        self.nbt_file_path = None
+        self._nbt_gzip = False
+        self._nbt_dirty = False
+        self._nbt_zip = None
+        self._nbt_zip_path = None
+        self._nbt_icon_cache = {}
+        self._nbt_hover_row = None
+        self._nbt_tooltip = None
+        self._nbt_tooltip_image = None
 
     def __init__(self):
         self._ui_queue = queue.Queue()
@@ -2217,7 +2381,7 @@ class MinecraftLauncher:
         return self.minecraft_dir
 
     def show_nbt_viewer(self):
-        """打开只读的 NBT 查看器"""
+        """打开 NBT 查看/编辑器"""
         if getattr(self, "nbt_window", None) is not None:
             try:
                 if self.nbt_window.winfo_exists():
@@ -2228,8 +2392,9 @@ class MinecraftLauncher:
                 pass
         self.nbt_window = tk.Toplevel(self.main_win)
         self.nbt_window.title("NBT 查看器")
-        self.nbt_window.geometry("960x620")
+        self.nbt_window.geometry("980x640")
         self.nbt_window.transient(self.main_win)
+        self.nbt_window.protocol("WM_DELETE_WINDOW", self.close_nbt_viewer)
         try:
             self.nbt_window.attributes("-alpha", self.alpha)
         except tk.TclError:
@@ -2240,15 +2405,35 @@ class MinecraftLauncher:
             pass
 
         top = tk.Frame(self.nbt_window)
-        top.pack(fill="x", padx=10, pady=8)
+        top.pack(fill="x", padx=10, pady=(8, 2))
         self.nbt_path_var = tk.StringVar(value="未打开文件")
         tk.Label(top, textvariable=self.nbt_path_var, anchor="w").pack(
             side="left", fill="x", expand=True
         )
-        ttk.Button(top, text="全部折叠", command=self.collapse_nbt_tree).pack(
-            side="right", padx=(6, 0)
+
+        tools = tk.Frame(self.nbt_window)
+        tools.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Button(tools, text="打开文件...", command=self.open_nbt_file).pack(
+            side="left"
         )
-        ttk.Button(top, text="打开文件...", command=self.open_nbt_file).pack(
+        ttk.Button(tools, text="保存", command=self.save_nbt_file).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(tools, text="另存为...", command=self.save_nbt_file_as).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(tools, text="编辑值", command=self.edit_nbt_value).pack(side="left")
+        ttk.Button(tools, text="新增", command=self.add_nbt_entry).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(tools, text="重命名", command=self.rename_nbt_entry).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(tools, text="删除", command=self.delete_nbt_entry).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(tools, text="全部折叠", command=self.collapse_nbt_tree).pack(
             side="right"
         )
 
@@ -2264,7 +2449,7 @@ class MinecraftLauncher:
         self.nbt_tree.heading("value", text="值")
         self.nbt_tree.column("#0", width=300, anchor="w")
         self.nbt_tree.column("type", width=110, anchor="w")
-        self.nbt_tree.column("value", width=500, anchor="w")
+        self.nbt_tree.column("value", width=520, anchor="w")
         yscroll = ttk.Scrollbar(
             tree_frame, orient="vertical", command=self.nbt_tree.yview
         )
@@ -2278,13 +2463,42 @@ class MinecraftLauncher:
         yscroll.grid(row=0, column=1, sticky="ns")
         xscroll.grid(row=1, column=0, sticky="ew")
         self.nbt_tree.bind("<<TreeviewOpen>>", self.on_nbt_tree_open)
+        self.nbt_tree.bind("<Double-1>", self.on_nbt_tree_double_click)
+        self.nbt_tree.bind("<F2>", lambda event: self.edit_nbt_value())
+        self.nbt_tree.bind("<Delete>", lambda event: self.delete_nbt_entry())
+        self.nbt_tree.bind("<Motion>", self.on_nbt_tree_motion)
+        self.nbt_tree.bind("<Leave>", lambda event: self.hide_nbt_tooltip())
+        self.nbt_window.bind("<Control-s>", lambda event: self.save_nbt_file())
 
         tk.Label(
             self.nbt_window,
-            text="只读查看，不会修改文件。支持 .dat / .nbt，不支持 region(.mca) 文件。",
+            text="双击数字/字符串可直接编辑；保存会自动备份 .bak，游戏运行中禁止保存。",
             anchor="w",
         ).pack(fill="x", padx=10, pady=(0, 8))
+
+        self.nbt_root = None
+        self.nbt_file_path = None
+        self._nbt_gzip = False
+        self._nbt_dirty = False
+        self._nbt_tags = {}
+        self._nbt_placeholders = set()
+        self._nbt_hover_row = None
         self.nbt_tree.delete(*self.nbt_tree.get_children(""))
+
+    def update_nbt_title(self):
+        title = "NBT 查看器"
+        if self.nbt_file_path:
+            title += " - " + os.path.basename(self.nbt_file_path)
+        if self._nbt_dirty:
+            title += " *"
+        try:
+            self.nbt_window.title(title)
+        except tk.TclError:
+            pass
+
+    def mark_nbt_dirty(self):
+        self._nbt_dirty = True
+        self.update_nbt_title()
 
     def open_nbt_file(self, path=None):
         """读取并显示一个 NBT 文件"""
@@ -2301,17 +2515,22 @@ class MinecraftLauncher:
         if not path:
             return
         try:
-            root = read_nbt_file(path)
+            root, compressed = load_nbt_document(path)
         except Exception as exp:
             tkinter.messagebox.showerror(
                 "无法读取 NBT", f"{os.path.basename(path)}\n{exp}"
             )
             return
+        self.nbt_root = root
+        self.nbt_file_path = os.path.abspath(path)
+        self._nbt_gzip = compressed
+        self._nbt_dirty = False
+        self._nbt_last_dir = os.path.dirname(self.nbt_file_path)
         self._nbt_tags = {}
         self._nbt_placeholders = set()
-        self._nbt_last_dir = os.path.dirname(os.path.abspath(path))
         self.nbt_tree.delete(*self.nbt_tree.get_children(""))
         self.nbt_path_var.set(path)
+        self.update_nbt_title()
         title = root.name or os.path.basename(path)
         iid = self.nbt_tree.insert(
             "",
@@ -2358,9 +2577,478 @@ class MinecraftLauncher:
             self.nbt_tree.delete(children[0])
             self.populate_nbt_children(iid, tag)
 
+    def on_nbt_tree_double_click(self, event):
+        iid = self.nbt_tree.identify_row(event.y)
+        if not iid:
+            return
+        self.nbt_tree.focus(iid)
+        tag = self._nbt_tags.get(iid)
+        if tag is not None and tag.tag_type in NBT_EDITABLE_TYPES:
+            self.edit_nbt_value()
+            return "break"
+
     def collapse_nbt_tree(self):
         for iid in self.nbt_tree.get_children(""):
             self.nbt_tree.item(iid, open=False)
+
+    def get_selected_nbt(self):
+        iid = self.nbt_tree.focus()
+        return iid, self._nbt_tags.get(iid)
+
+    def edit_nbt_value(self):
+        iid, tag = self.get_selected_nbt()
+        if tag is None:
+            return
+        if tag.tag_type not in NBT_EDITABLE_TYPES:
+            tkinter.messagebox.showinfo(
+                "提示", "Compound / List / 数组节点不能直接编辑值。"
+            )
+            return
+        ok, value = self.prompt_nbt_value(tag)
+        if not ok:
+            return
+        tag.value = value
+        try:
+            self.nbt_tree.item(
+                iid, values=(nbt_type_label(tag), nbt_summary(tag))
+            )
+        except tk.TclError:
+            return
+        self.mark_nbt_dirty()
+
+    def center_nbt_dialog(self, dialog):
+        try:
+            dialog.update_idletasks()
+            x = self.nbt_window.winfo_rootx() + (
+                self.nbt_window.winfo_width() - dialog.winfo_width()
+            ) // 2
+            y = self.nbt_window.winfo_rooty() + (
+                self.nbt_window.winfo_height() - dialog.winfo_height()
+            ) // 2
+            dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except tk.TclError:
+            pass
+
+    def prompt_nbt_value(self, tag):
+        dialog = tk.Toplevel(self.nbt_window)
+        dialog.title("编辑 " + nbt_type_name(tag.tag_type))
+        dialog.transient(self.nbt_window)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        tk.Label(dialog, text="输入新的值:").grid(
+            row=0, column=0, sticky="w", padx=10, pady=(10, 2), columnspan=2
+        )
+        initial = tag.value if tag.tag_type == NBT_STRING else str(tag.value)
+        var = tk.StringVar(value=initial)
+        entry = tk.Entry(dialog, textvariable=var, width=44)
+        entry.grid(row=1, column=0, columnspan=2, padx=10, sticky="ew")
+        entry.focus_set()
+        entry.select_range(0, "end")
+        result = {"ok": False, "value": None}
+
+        def on_ok(event=None):
+            try:
+                result["value"] = parse_nbt_value(tag.tag_type, var.get())
+            except ValueError as exp:
+                tkinter.messagebox.showerror("输入错误", str(exp), parent=dialog)
+                return
+            result["ok"] = True
+            dialog.destroy()
+
+        def on_cancel(event=None):
+            dialog.destroy()
+
+        ttk.Button(dialog, text="确定", command=on_ok).grid(
+            row=2, column=0, padx=10, pady=10, sticky="e"
+        )
+        ttk.Button(dialog, text="取消", command=on_cancel).grid(
+            row=2, column=1, padx=10, pady=10, sticky="w"
+        )
+        entry.bind("<Return>", on_ok)
+        dialog.bind("<Escape>", on_cancel)
+        self.center_nbt_dialog(dialog)
+        dialog.wait_window()
+        return result["ok"], result["value"]
+
+    def add_nbt_entry(self):
+        iid = self.nbt_tree.focus()
+        if not iid:
+            roots = self.nbt_tree.get_children("")
+            iid = roots[0] if roots else ""
+        tag = self._nbt_tags.get(iid)
+        if tag is None:
+            return
+        if tag.tag_type == NBT_COMPOUND:
+            name, tag_type, value = self.prompt_new_nbt_key()
+            if name is None:
+                return
+            if name in tag.value:
+                tkinter.messagebox.showerror("错误", f"键「{name}」已经存在。")
+                return
+            tag.value[name] = NbtTag(tag_type, value, name=name)
+            self.refresh_nbt_node(iid, tag)
+            self.mark_nbt_dirty()
+        elif tag.tag_type == NBT_LIST:
+            element_type = tag.element_type
+            if element_type is None and tag.value:
+                element_type = tag.value[0].tag_type
+            if element_type is None:
+                element_type = NBT_COMPOUND
+            tag.value.append(NbtTag(element_type, default_nbt_value(element_type)))
+            if tag.element_type is None:
+                tag.element_type = element_type
+            self.refresh_nbt_node(iid, tag)
+            self.mark_nbt_dirty()
+        else:
+            tkinter.messagebox.showinfo(
+                "提示", "请先选择一个 Compound 或 List 节点再新增。"
+            )
+
+    def prompt_new_nbt_key(self):
+        dialog = tk.Toplevel(self.nbt_window)
+        dialog.title("新增 NBT 键")
+        dialog.transient(self.nbt_window)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        name_var = tk.StringVar()
+        type_var = tk.StringVar(value="Int")
+        value_var = tk.StringVar(value="0")
+        tk.Label(dialog, text="键名:").grid(row=0, column=0, sticky="w", padx=10, pady=4)
+        name_entry = tk.Entry(dialog, textvariable=name_var, width=32)
+        name_entry.grid(row=0, column=1, padx=10, pady=4, sticky="ew")
+        tk.Label(dialog, text="类型:").grid(row=1, column=0, sticky="w", padx=10, pady=4)
+        type_box = ttk.Combobox(
+            dialog,
+            textvariable=type_var,
+            values=list(NBT_EDITABLE_NAME_TO_TYPE.keys()),
+            state="readonly",
+        )
+        type_box.grid(row=1, column=1, padx=10, pady=4, sticky="ew")
+        tk.Label(dialog, text="值:").grid(row=2, column=0, sticky="w", padx=10, pady=4)
+        value_entry = tk.Entry(dialog, textvariable=value_var, width=32)
+        value_entry.grid(row=2, column=1, padx=10, pady=4, sticky="ew")
+        result = {"name": None, "type": None, "value": None}
+        name_entry.focus_set()
+
+        def on_ok(event=None):
+            name = name_var.get().strip()
+            if not name:
+                tkinter.messagebox.showerror("错误", "键名不能为空。", parent=dialog)
+                return
+            tag_type = NBT_EDITABLE_NAME_TO_TYPE.get(type_var.get())
+            if tag_type is None:
+                tkinter.messagebox.showerror("错误", "请选择类型。", parent=dialog)
+                return
+            try:
+                value = parse_nbt_value(tag_type, value_var.get())
+            except ValueError as exp:
+                tkinter.messagebox.showerror("输入错误", str(exp), parent=dialog)
+                return
+            result.update({"name": name, "type": tag_type, "value": value})
+            dialog.destroy()
+
+        def on_cancel(event=None):
+            dialog.destroy()
+
+        ttk.Button(dialog, text="确定", command=on_ok).grid(
+            row=3, column=0, padx=10, pady=10, sticky="e"
+        )
+        ttk.Button(dialog, text="取消", command=on_cancel).grid(
+            row=3, column=1, padx=10, pady=10, sticky="w"
+        )
+        name_entry.bind("<Return>", on_ok)
+        dialog.bind("<Escape>", on_cancel)
+        self.center_nbt_dialog(dialog)
+        dialog.wait_window()
+        return result["name"], result["type"], result["value"]
+
+    def rename_nbt_entry(self):
+        iid, tag = self.get_selected_nbt()
+        parent = self.nbt_tree.parent(iid)
+        parent_tag = self._nbt_tags.get(parent)
+        if tag is None or parent_tag is None or parent_tag.tag_type != NBT_COMPOUND:
+            tkinter.messagebox.showinfo("提示", "只能重命名 Compound 下的键。")
+            return
+        old_name = tag.name
+        new_name = pymsgbox.prompt("输入新的键名:", "重命名 NBT 键", default=old_name)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == old_name:
+            return
+        if new_name in parent_tag.value:
+            tkinter.messagebox.showerror("错误", f"键「{new_name}」已经存在。")
+            return
+        items = []
+        for key, child in parent_tag.value.items():
+            if key == old_name:
+                child.name = new_name
+                items.append((new_name, child))
+            else:
+                items.append((key, child))
+        parent_tag.value = dict(items)
+        self.refresh_nbt_node(parent, parent_tag)
+        self.mark_nbt_dirty()
+
+    def delete_nbt_entry(self):
+        iid, tag = self.get_selected_nbt()
+        parent = self.nbt_tree.parent(iid)
+        parent_tag = self._nbt_tags.get(parent)
+        if tag is None or parent_tag is None:
+            tkinter.messagebox.showinfo("提示", "根节点不能删除。")
+            return
+        label = self.nbt_tree.item(iid, "text")
+        if not tkinter.messagebox.askyesno("删除节点", f"确定删除「{label}」吗？"):
+            return
+        if parent_tag.tag_type == NBT_COMPOUND:
+            parent_tag.value.pop(tag.name, None)
+        elif parent_tag.tag_type == NBT_LIST:
+            for index, child in enumerate(parent_tag.value):
+                if child is tag:
+                    del parent_tag.value[index]
+                    break
+        self.refresh_nbt_node(parent, parent_tag)
+        self.mark_nbt_dirty()
+
+    def _forget_nbt_children(self, iid):
+        for child in self.nbt_tree.get_children(iid):
+            self._forget_nbt_children(child)
+            self._nbt_tags.pop(child, None)
+            self._nbt_placeholders.discard(child)
+            self.nbt_tree.delete(child)
+
+    def refresh_nbt_node(self, iid, tag):
+        self._forget_nbt_children(iid)
+        self.populate_nbt_children(iid, tag)
+        try:
+            self.nbt_tree.item(iid, values=(nbt_type_label(tag), nbt_summary(tag)))
+        except tk.TclError:
+            pass
+
+    def save_nbt_file(self):
+        if self.nbt_root is None or not self.nbt_file_path:
+            return False
+        try:
+            if self.get_running_game_processes():
+                tkinter.messagebox.showerror(
+                    "无法保存",
+                    "检测到 Minecraft 正在运行，请先关闭游戏再保存，避免文件被占用或损坏。",
+                )
+                return False
+        except Exception:
+            pass
+        try:
+            save_nbt_document(self.nbt_file_path, self.nbt_root, self._nbt_gzip)
+        except Exception as exp:
+            tkinter.messagebox.showerror("保存失败", str(exp))
+            return False
+        self._nbt_dirty = False
+        self.update_nbt_title()
+        tkinter.messagebox.showinfo(
+            "保存成功",
+            f"已保存到:\n{self.nbt_file_path}\n（备份: {self.nbt_file_path}.bak）",
+        )
+        return True
+
+    def save_nbt_file_as(self):
+        if self.nbt_root is None:
+            return False
+        path = tkinter.filedialog.asksaveasfilename(
+            title="NBT 另存为",
+            initialdir=self.get_nbt_initial_dir(),
+            initialfile=os.path.basename(self.nbt_file_path or "output.dat"),
+            defaultextension=".dat",
+            filetypes=[("NBT 数据文件", "*.dat"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return False
+        try:
+            save_nbt_document(path, self.nbt_root, self._nbt_gzip)
+        except Exception as exp:
+            tkinter.messagebox.showerror("保存失败", str(exp))
+            return False
+        self.nbt_file_path = os.path.abspath(path)
+        self.nbt_path_var.set(path)
+        self._nbt_dirty = False
+        self.update_nbt_title()
+        tkinter.messagebox.showinfo("保存成功", f"已保存到:\n{self.nbt_file_path}")
+        return True
+
+    def close_nbt_viewer(self):
+        if self._nbt_dirty:
+            answer = tkinter.messagebox.askyesnocancel(
+                "NBT 查看器", "有未保存的修改，是否保存？"
+            )
+            if answer is None:
+                return
+            if answer and not self.save_nbt_file():
+                return
+        self.close_nbt_texture_zip()
+        try:
+            if self._nbt_tooltip is not None:
+                self._nbt_tooltip.destroy()
+        except tk.TclError:
+            pass
+        self._nbt_tooltip = None
+        try:
+            self.nbt_window.destroy()
+        except tk.TclError:
+            pass
+
+    def get_nbt_version_jar(self):
+        """找到当前版本对应的客户端 jar(支持 inheritsFrom)"""
+        versions_dir = os.path.join(self.minecraft_dir, "versions")
+        current = str(self.selected_version or "")
+        seen = set()
+        while current and current not in seen:
+            seen.add(current)
+            jar = os.path.join(versions_dir, current, current + ".jar")
+            if os.path.isfile(jar):
+                return jar
+            json_path = os.path.join(versions_dir, current, current + ".json")
+            try:
+                with open(json_path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                return None
+            current = data.get("jar") or data.get("inheritsFrom")
+        return None
+
+    def get_nbt_texture_zip(self):
+        jar = self.get_nbt_version_jar()
+        if jar is None:
+            return None
+        if self._nbt_zip is None or self._nbt_zip_path != jar:
+            self.close_nbt_texture_zip()
+            try:
+                self._nbt_zip = zipfile.ZipFile(jar)
+                self._nbt_zip_path = jar
+            except Exception as exp:
+                print(f"[WARN] 无法读取版本 jar: {exp}")
+                self._nbt_zip = None
+        return self._nbt_zip
+
+    def close_nbt_texture_zip(self):
+        if self._nbt_zip is not None:
+            try:
+                self._nbt_zip.close()
+            except Exception:
+                pass
+        self._nbt_zip = None
+        self._nbt_zip_path = None
+        self._nbt_icon_cache = {}
+
+    def get_nbt_item_icon(self, item_id):
+        """从当前版本的客户端 jar 里取物品图标"""
+        item_id = str(item_id or "")
+        if ":" not in item_id:
+            return None
+        namespace, path = item_id.split(":", 1)
+        if namespace != "minecraft" or not path:
+            return None
+        if item_id in self._nbt_icon_cache:
+            return self._nbt_icon_cache[item_id]
+        zip_file = self.get_nbt_texture_zip()
+        if zip_file is None:
+            return None
+        image = None
+        for folder in ("item", "block"):
+            try:
+                data = zip_file.read(
+                    f"assets/minecraft/textures/{folder}/{path}.png"
+                )
+            except KeyError:
+                continue
+            try:
+                image = tk.PhotoImage(data=data)
+                if 0 < image.width() <= 32:
+                    image = image.zoom(2)
+            except tk.TclError:
+                image = None
+            break
+        self._nbt_icon_cache[item_id] = image
+        return image
+
+    def get_nbt_item_id(self, iid):
+        """从节点或其上级 Compound 里找物品 id"""
+        current = iid
+        depth = 0
+        while current and depth <= 4:
+            tag = self._nbt_tags.get(current)
+            if tag is not None and tag.tag_type == NBT_COMPOUND:
+                id_tag = tag.value.get("id")
+                if id_tag is not None and id_tag.tag_type == NBT_STRING:
+                    item_id = str(id_tag.value)
+                    if item_id.startswith("minecraft:"):
+                        return item_id
+                    if ":" not in item_id and item_id:
+                        return "minecraft:" + item_id
+            current = self.nbt_tree.parent(current)
+            depth += 1
+        return None
+
+    def ensure_nbt_tooltip(self):
+        if self._nbt_tooltip is not None:
+            try:
+                if self._nbt_tooltip.winfo_exists():
+                    return
+            except tk.TclError:
+                pass
+        self._nbt_tooltip = tk.Toplevel(self.main_win)
+        self._nbt_tooltip.overrideredirect(True)
+        try:
+            self._nbt_tooltip.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        frame = tk.Frame(self._nbt_tooltip, relief="solid", borderwidth=1)
+        frame.pack()
+        self._nbt_tooltip_image_label = tk.Label(frame)
+        self._nbt_tooltip_image_label.pack(side="left", padx=(6, 0), pady=4)
+        self._nbt_tooltip_text_label = tk.Label(frame, anchor="w", justify="left")
+        self._nbt_tooltip_text_label.pack(side="left", padx=6, pady=4)
+        self._nbt_tooltip.withdraw()
+
+    def show_nbt_item_tooltip(self, item_id, event):
+        image = self.get_nbt_item_icon(item_id)
+        if image is None:
+            self.hide_nbt_tooltip()
+            return
+        self.ensure_nbt_tooltip()
+        self._nbt_tooltip_image = image
+        self._nbt_tooltip_image_label.config(image=image)
+        self._nbt_tooltip_text_label.config(text=item_id)
+        try:
+            self._nbt_tooltip.geometry(f"+{event.x_root + 18}+{event.y_root + 18}")
+            self._nbt_tooltip.deiconify()
+            self._nbt_tooltip.lift()
+        except tk.TclError:
+            pass
+
+    def hide_nbt_tooltip(self):
+        if self._nbt_tooltip is None:
+            return
+        try:
+            self._nbt_tooltip.withdraw()
+        except tk.TclError:
+            self._nbt_tooltip = None
+
+    def on_nbt_tree_motion(self, event):
+        iid = self.nbt_tree.identify_row(event.y)
+        if iid != self._nbt_hover_row:
+            self._nbt_hover_row = iid
+            item_id = self.get_nbt_item_id(iid) if iid else None
+            if item_id:
+                self.show_nbt_item_tooltip(item_id, event)
+            else:
+                self.hide_nbt_tooltip()
+        elif iid and self._nbt_tooltip is not None:
+            try:
+                if self._nbt_tooltip.winfo_ismapped():
+                    self._nbt_tooltip.geometry(
+                        f"+{event.x_root + 18}+{event.y_root + 18}"
+                    )
+            except tk.TclError:
+                pass
 
     def change_version_and_modify_version(self):
         self.set_current_page("modify")
