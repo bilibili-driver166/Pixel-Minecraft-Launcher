@@ -1,0 +1,25 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.bak
+
+# ---- 虚拟环境 / IDE ----
+.venv/
+.idea/
+.vscode/
+
+# ---- 启动器运行时数据(含账号 Token、服务器路径, 不要提交) ----
+PML/
+logs/
+mods/
+saves/
+config/
+resourcepacks/
+shaderpacks/
+versions/
+
+# ---- 打包产物 ----
+*.exe
+
+# ---- 旧版本源码(仓库只维护根目录 main.py) ----
+source code/

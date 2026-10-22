@@ -1,0 +1,26 @@
+# Pixel Minecraft Launcher
+这是一个由bilibili UP主核裂变的x使用Python开发的一个新生代图形化启动器。
+
+## 功能
+
+- 游戏版本下载与启动（支持离线账户）
+- Forge / Fabric 模组加载器安装与加载器版本选择
+- 模组、资源包、光影、存档管理
+- 版本隔离（隔离mod / 完全隔离）
+- 服务器启动与管理
+- 基于 maliang 的界面，支持透明度和背景颜色自定义
+
+## 运行
+
+```bash
+pip install -r requirements.txt
+python main.py
+```
+
+需要 Python 3.11+，并安装 Java（启动游戏、安装 Forge/Fabric 时使用）。
+
+## 说明
+
+- 首次运行会在同目录生成 `PML/PML.config`，保存用户名、Java、服务器、Token 等设置，**请勿提交到仓库**。
+- 访问 Mojang 失败时会自动尝试 BMCLAPI 镜像。
+- `source code/` 下保留历史版本源码，仓库只维护根目录的 `main.py`。
