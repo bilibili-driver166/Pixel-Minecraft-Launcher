@@ -22,6 +22,7 @@ import tkinter.messagebox as messagebox
 import tkinter.colorchooser
 import tkinter.filedialog
 import colorama
+import concurrent.futures
 import webbrowser
 import shutil
 import subprocess
@@ -37,10 +38,13 @@ JAVA_SEARCH_DIRS = ("C:/Program Files/Java", "C:/Program Files (x86)/Java")
 # 全盘扫描 Java 时跳过的目录(系统目录/缓存目录)
 JAVA_SCAN_SKIP_DIRS = {
     "windows",
+    "windows.old",
     "$recycle.bin",
     "system volume information",
     "recovery",
     "perflogs",
+    "$winreagent",
+    "config.msi",
     "windowsapps",
     "winsxs",
     "installer",
@@ -50,11 +54,39 @@ JAVA_SCAN_SKIP_DIRS = {
     "__pycache__",
     ".gradle",
     ".m2",
+    ".venv",
+    "venv",
+    "site-packages",
     "temp",
     "tmp",
     "cache",
     "caches",
+    "inetcache",
+    "webcache",
+    "temporary internet files",
+    "steamapps",
+    "epic games",
+    "riot games",
+    "battle.net",
+    "origin games",
 }
+JAVA_SCAN_SKIP_PATH_PARTS = (
+    "/appdata/local/microsoft",
+    "/appdata/local/google",
+    "/appdata/local/mozilla",
+    "/appdata/local/packages",
+    "/appdata/local/temp",
+    "/programdata/microsoft/windows",
+    "/programdata/package cache",
+)
+JAVA_SCAN_MAX_DEPTH = 12
+
+
+def should_skip_java_dir(path):
+    lowered = os.path.normpath(path).lower().replace(chr(92), "/")
+    return any(part in lowered for part in JAVA_SCAN_SKIP_PATH_PARTS)
+
+
 BMCLAPI_FORGE_URL = "https://bmclapi2.bangbang93.com/forge/minecraft/{version}"
 BMCLAPI_FABRIC_LOADER_URL = "https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader"
 BMCLAPI_FABRIC_GAME_URL = "https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/game"
@@ -226,6 +258,22 @@ def parse_java_cache(raw):
             if isinstance(item, (list, tuple)) and len(item) >= 2:
                 result.append((str(item[0]), str(item[1])))
     return result
+
+
+def read_java_release_version(java_path):
+    """从 JDK/JRE 的 release 文件快速读取版本, 避免启动 java.exe"""
+    try:
+        base = os.path.dirname(os.path.dirname(str(java_path)))
+        with open(
+            os.path.join(base, "release"), encoding="utf-8", errors="ignore"
+        ) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("JAVA_VERSION="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        return ""
+    return ""
 
 
 def offline_uuid(username: str) -> str:
@@ -1839,6 +1887,9 @@ class MinecraftLauncher:
 
     def read_java_version(self, java_path):
         """读取 Java 的版本号, 读取失败时返回空字符串"""
+        release_version = read_java_release_version(java_path)
+        if release_version:
+            return release_version
         try:
             java_exe = java_path
             if os.path.basename(java_exe).lower() == "javaw.exe":
@@ -1976,7 +2027,8 @@ class MinecraftLauncher:
                     index = position
                     break
         self.CurJavaVar = index
-        self.selected_java_path = places[index - 1] if index else ""
+        if index:
+            self.selected_java_path = places[index - 1]
         combobox.current(index)
 
     def startup_java_check(self):
@@ -2007,6 +2059,8 @@ class MinecraftLauncher:
 
     def finish_java_check(self, count):
         self.refresh_java_combobox()
+        if self.CurJavaVar == 0:
+            self.selected_java_path = ""
         self.save_all()
         if count == 0:
             self.refresh_java_list(manual=False)
@@ -2025,7 +2079,12 @@ class MinecraftLauncher:
 
         def worker():
             try:
-                found = self.scan_java_disks(scan_id)
+                found = self.scan_java_disks(
+                    scan_id,
+                    lambda partial: self.ui_call(
+                        self.apply_partial_java_results, partial, scan_id
+                    ),
+                )
             except Exception as exp:
                 print(f"[WARN] 扫描 Java 失败: {exp}")
                 self.ui_call(self.update_java_status, f"扫描 Java 失败: {exp}")
@@ -2039,6 +2098,14 @@ class MinecraftLauncher:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def apply_partial_java_results(self, partial, scan_id):
+        if scan_id != getattr(self, "_java_scan_id", 0):
+            return
+        self.java_cache = partial
+        self._java_entries = None
+        self.refresh_java_combobox()
+        self.update_java_status(f"已找到 {len(partial)} 个，继续扫描...")
+
     def finish_java_scan(self, found, scan_id):
         if scan_id != getattr(self, "_java_scan_id", 0):
             return
@@ -2049,6 +2116,8 @@ class MinecraftLauncher:
         if found is None:
             return
         self.refresh_java_combobox()
+        if self.CurJavaVar == 0:
+            self.selected_java_path = ""
         self.save_all()
         self.update_java_status(f"已找到 {len(found)} 个 Java")
 
@@ -2075,27 +2144,56 @@ class MinecraftLauncher:
             ]
         return roots
 
-    def scan_java_disks(self, scan_id):
+    def scan_java_disks(self, scan_id, on_partial=None):
         results = []
         seen = set()
-        for root in self.get_java_scan_roots():
-            if scan_id != self._java_scan_id:
-                return results
-            self.scan_java_root(root, results, seen, scan_id)
+        lock = threading.Lock()
+        roots = self.get_java_scan_roots()
+        if not roots:
+            return results
+        workers = max(1, min(len(roots), 3))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers
+        ) as executor:
+            futures = [
+                executor.submit(
+                    self.scan_java_root, root, results, seen, scan_id, lock
+                )
+                for root in roots
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                if scan_id != self._java_scan_id:
+                    break
+                try:
+                    future.result()
+                except Exception as exp:
+                    print(f"[WARN] 扫描磁盘失败: {exp}")
+                if on_partial is not None:
+                    on_partial(list(results))
         return results
 
-    def scan_java_root(self, root, results, seen, scan_id):
+    def scan_java_root(self, root, results, seen, scan_id, lock=None):
+        if lock is None:
+            lock = threading.Lock()
         scanned = 0
         for current, dirs, files in os.walk(
             root, topdown=True, onerror=lambda error: None
         ):
             if scan_id != self._java_scan_id:
                 return
+            depth = (
+                current[len(root) :].count(os.sep)
+                if current.startswith(root)
+                else 0
+            )
+            if depth >= JAVA_SCAN_MAX_DEPTH:
+                dirs[:] = []
             dirs[:] = [
                 name
                 for name in dirs
                 if name.lower() not in JAVA_SCAN_SKIP_DIRS
                 and not os.path.islink(os.path.join(current, name))
+                and not should_skip_java_dir(os.path.join(current, name))
             ]
             scanned += 1
             if scanned % 800 == 0:
@@ -2112,16 +2210,19 @@ class MinecraftLauncher:
                 continue
             java_path = os.path.join(current, java_name)
             key = os.path.normcase(os.path.abspath(java_path))
-            if key in seen:
-                continue
+            with lock:
+                if key in seen:
+                    continue
             version = self.read_java_version(java_path)
             if not version:
                 continue
-            seen.add(key)
-            javaw_path = os.path.join(current, "javaw.exe")
-            launch_path = javaw_path if os.path.isfile(javaw_path) else java_path
-            results.append((launch_path.replace("\\", "/"), version))
-
+            with lock:
+                if key in seen:
+                    continue
+                seen.add(key)
+                javaw_path = os.path.join(current, "javaw.exe")
+                launch_path = javaw_path if os.path.isfile(javaw_path) else java_path
+                results.append((launch_path.replace("\\", "/"), version))
     def copy_to_version_folder(self, source, folder):
         """把文件复制到当前版本对应的文件夹中"""
         target_dir = (
