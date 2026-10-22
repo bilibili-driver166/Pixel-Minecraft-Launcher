@@ -757,6 +757,8 @@ class MinecraftLauncher:
         self._nbt_item_list_cache_key = None
         self._nbt_item_names_cache = None
         self._nbt_item_names_key = None
+        self._nbt_lang_cache = None
+        self._nbt_lang_key = None
         self._nbt_hover_row = None
         self._nbt_tooltip = None
         self._nbt_tooltip_image = None
@@ -2959,6 +2961,8 @@ class MinecraftLauncher:
         self._nbt_item_list_cache_key = None
         self._nbt_item_names_cache = None
         self._nbt_item_names_key = None
+        self._nbt_lang_cache = None
+        self._nbt_lang_key = None
 
     def get_nbt_item_icon(self, item_id):
         """从当前版本的客户端 jar 里取物品图标"""
@@ -2992,13 +2996,15 @@ class MinecraftLauncher:
         return image
 
     def list_nbt_items(self):
-        """列出当前版本可用的原版物品 id"""
+        """列出当前版本可用的原版物品 id(过滤掉模型变体)"""
         jar = self.get_nbt_version_jar()
         if jar is None:
             return []
+        index_id = self.get_nbt_asset_index_id()
+        cache_key = (jar, index_id)
         if (
             self._nbt_item_list_cache is not None
-            and self._nbt_item_list_cache_key == jar
+            and self._nbt_item_list_cache_key == cache_key
         ):
             return self._nbt_item_list_cache
         zip_file = self.get_nbt_texture_zip()
@@ -3026,9 +3032,30 @@ class MinecraftLauncher:
                 item = name[len(prefix) : -len(".png")]
                 if item and "/" not in item:
                     items.add("minecraft:" + item)
+        # 用语言文件里的物品键过滤 compass_00 / clock_00 这类模型变体
+        lang = self.load_nbt_lang()
+        if lang:
+            valid = set()
+            for key in lang:
+                if key.startswith("item.minecraft."):
+                    valid.add("minecraft:" + key[len("item.minecraft.") :])
+                elif key.startswith("block.minecraft."):
+                    valid.add("minecraft:" + key[len("block.minecraft.") :])
+            if valid:
+                filtered = items & valid
+                if filtered:
+                    items = filtered
+        items = {
+            item_id
+            for item_id in items
+            if not re.match(
+                r"^minecraft:(?:recovery_)?(?:compass|clock)_\d+$", item_id
+            )
+        }
+        items.discard("minecraft:air")
         result = sorted(items)
         self._nbt_item_list_cache = result
-        self._nbt_item_list_cache_key = jar
+        self._nbt_item_list_cache_key = cache_key
         return result
 
     def get_nbt_asset_index_id(self):
@@ -3078,6 +3105,32 @@ class MinecraftLauncher:
         except (OSError, ValueError):
             return {}
 
+    def load_nbt_lang(self):
+        """加载中文语言文件(优先本地 assets, 其次版本 jar)"""
+        jar = self.get_nbt_version_jar()
+        if jar is None:
+            return {}
+        index_id = self.get_nbt_asset_index_id()
+        cache_key = (jar, index_id)
+        if self._nbt_lang_cache is not None and self._nbt_lang_key == cache_key:
+            return self._nbt_lang_cache
+        lang = {}
+        if index_id:
+            lang = self.load_nbt_lang_from_assets(index_id, "zh_cn.json")
+        if not lang:
+            zip_file = self.get_nbt_texture_zip()
+            if zip_file is not None:
+                for lang_name in ("zh_cn.json", "en_us.json"):
+                    try:
+                        raw = zip_file.read("assets/minecraft/lang/" + lang_name)
+                        lang = json.loads(raw.decode("utf-8"))
+                        break
+                    except (KeyError, ValueError):
+                        continue
+        self._nbt_lang_cache = lang
+        self._nbt_lang_key = cache_key
+        return lang
+
     def get_nbt_item_names(self):
         """读取物品显示名(优先本地 assets 的中文语言文件)"""
         jar = self.get_nbt_version_jar()
@@ -3090,18 +3143,7 @@ class MinecraftLauncher:
             and self._nbt_item_names_key == cache_key
         ):
             return self._nbt_item_names_cache
-        zip_file = self.get_nbt_texture_zip()
-        lang = {}
-        if index_id:
-            lang = self.load_nbt_lang_from_assets(index_id, "zh_cn.json")
-        if not lang and zip_file is not None:
-            for lang_name in ("zh_cn.json", "en_us.json"):
-                try:
-                    raw = zip_file.read("assets/minecraft/lang/" + lang_name)
-                    lang = json.loads(raw.decode("utf-8"))
-                    break
-                except (KeyError, ValueError):
-                    continue
+        lang = self.load_nbt_lang()
         names = {}
         if lang:
             for item_id in self.list_nbt_items():
