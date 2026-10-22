@@ -34,6 +34,27 @@ import maliang.theme as theme
 
 CONFIG_PATH = "./PML/PML.config"
 JAVA_SEARCH_DIRS = ("C:/Program Files/Java", "C:/Program Files (x86)/Java")
+# 全盘扫描 Java 时跳过的目录(系统目录/缓存目录)
+JAVA_SCAN_SKIP_DIRS = {
+    "windows",
+    "$recycle.bin",
+    "system volume information",
+    "recovery",
+    "perflogs",
+    "windowsapps",
+    "winsxs",
+    "installer",
+    "package cache",
+    "node_modules",
+    ".git",
+    "__pycache__",
+    ".gradle",
+    ".m2",
+    "temp",
+    "tmp",
+    "cache",
+    "caches",
+}
 BMCLAPI_FORGE_URL = "https://bmclapi2.bangbang93.com/forge/minecraft/{version}"
 BMCLAPI_FABRIC_LOADER_URL = "https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader"
 BMCLAPI_FABRIC_GAME_URL = "https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/game"
@@ -192,6 +213,23 @@ def parse_config_list(raw):
     for item in raw.split(", "):
         item = strip_config_value(item)
         result.append(item)
+    return result
+
+
+def parse_java_cache(raw):
+    """解析缓存的 Java 列表: [(路径, 版本), ...]"""
+    raw = (raw or "").strip()
+    if raw in ("", "[]"):
+        return []
+    try:
+        value = ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+        return []
+    result = []
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                result.append((str(item[0]), str(item[1])))
     return result
 
 
@@ -665,6 +703,8 @@ class MinecraftLauncher:
                         "VerSplit = 0\n"
                         "curJava = 0\n"
                         "exJava = []\n"
+                        "JavaCache = []\n"
+                        'SelectedJava = ""\n'
                     )
         else:
             os.mkdir("PML")
@@ -707,6 +747,10 @@ class MinecraftLauncher:
                     self.CurJavaVar = int(float(strip_config_value(value)))
                 elif key == "exjava":
                     self.exjavaplace = parse_config_list(value)
+                elif key == "javacache":
+                    self.java_cache = parse_java_cache(value)
+                elif key == "selectedjava":
+                    self.selected_java_path = strip_config_value(value)
                 elif key == "alpha":
                     self.alpha = float(strip_config_value(value))
             except (TypeError, ValueError):
@@ -739,6 +783,9 @@ class MinecraftLauncher:
         self.support_mod = False
         self.modlistlist = []
         self._java_entries = None
+        self.java_cache = []
+        self.selected_java_path = ""
+        self._java_scan_id = 0
         self.read_configs()
         self.save_selected = ""
         self.current_max = 0
@@ -853,6 +900,7 @@ class MinecraftLauncher:
 
         self.create_all()
         self.create_main()
+        self.main_win.after(400, self.startup_java_check)
         # 欢迎标题
         self.main_win.config(bg=self.bg)
         self.Label = tk.Label(
@@ -1389,6 +1437,19 @@ class MinecraftLauncher:
             self.PML_Setting_Frame, text="手动添加Java", command=self.add_java
         )
         self.Java_add_butt.place(x=575, y=146)
+        self.Java_Refresh_Button = tk.Button(
+            self.PML_Setting_Frame, text="刷新", command=self.refresh_java_list
+        )
+        self.Java_Refresh_Button.place(x=680, y=146)
+        self.Java_Scan_Label = tk.Label(
+            self.PML_Setting_Frame,
+            text="",
+            font=("等线", 9),
+            fg="gray",
+            wraplength=320,
+            justify="left",
+        )
+        self.Java_Scan_Label.place(x=575, y=178)
         self.NbtViewerLabel = tk.Label(
             self.PML_Setting_Frame, text="NBT 文件查看:", font=("等线", 13)
         )
@@ -1755,10 +1816,8 @@ class MinecraftLauncher:
             return
         self.exjavaplace.append(javawplace)
         self._java_entries = None
-        try:
-            self.Java_Combobox.config(values=["自动选择"] + self.get_java())
-        except AttributeError:
-            pass
+        self.selected_java_path = javawplace
+        self.refresh_java_combobox()
         self.save_all()
 
     def Change_Ver_split(self, *args):
@@ -1799,8 +1858,13 @@ class MinecraftLauncher:
             java_exe = java_path
             if os.path.basename(java_exe).lower() == "javaw.exe":
                 java_exe = os.path.join(os.path.dirname(java_exe), "java.exe")
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             result = subprocess.run(
-                [java_exe, "-version"], text=True, capture_output=True, timeout=15
+                [java_exe, "-version"],
+                text=True,
+                capture_output=True,
+                timeout=15,
+                creationflags=creation_flags,
             )
             text = (result.stderr or result.stdout).strip().splitlines()[0]
             match = re.search(r'version "([^"]+)"', text)
@@ -1839,6 +1903,16 @@ class MinecraftLauncher:
                         f"{''.join(name.split('-')).upper()} ({shown_path}) [全局]",
                         name.split("-")[-1],
                     )
+
+        for java_path, version in getattr(self, "java_cache", []):
+            if not java_path:
+                continue
+            shown_path = str(java_path).replace("\\", "/")
+            add(
+                shown_path,
+                f"{version or '未知版本'} ({shown_path}) [扫描]",
+                version,
+            )
 
         for java_path in self.exjavaplace:
             if not java_path or not java_path.strip():
@@ -1882,7 +1956,186 @@ class MinecraftLauncher:
             )
         except ValueError:
             self.CurJavaVar = 0
+        places = self.get_java_place()
+        index = self.CurJavaVar - 1
+        self.selected_java_path = places[index] if 0 <= index < len(places) else ""
         self.save_all()
+
+    def update_java_status(self, text):
+        print(f"[Java] {text}")
+        try:
+            self.Java_Scan_Label.config(text=text)
+        except AttributeError:
+            pass
+
+    def refresh_java_combobox(self):
+        """按当前缓存重新填充 Java 下拉框, 尽量保持选中的路径"""
+        try:
+            combobox = self.Java_Combobox
+        except AttributeError:
+            return
+        entries = self.get_java()
+        places = self.get_java_place()
+        target = self.selected_java_path
+        if not target and 0 < self.CurJavaVar <= len(places):
+            target = places[self.CurJavaVar - 1]
+        try:
+            combobox.config(values=["自动选择"] + entries)
+        except tk.TclError:
+            return
+        index = 0
+        if target:
+            normalized = os.path.normcase(os.path.abspath(target))
+            for position, place in enumerate(places, start=1):
+                if os.path.normcase(os.path.abspath(place)) == normalized:
+                    index = position
+                    break
+        self.CurJavaVar = index
+        self.selected_java_path = places[index - 1] if index else ""
+        combobox.current(index)
+
+    def startup_java_check(self):
+        """启动时逐个测试缓存的 Java, 无效的删掉"""
+        cache = list(getattr(self, "java_cache", []) or [])
+        if not cache:
+            self.refresh_java_list(manual=False)
+            return
+        self.update_java_status("正在检查 Java...")
+        validation_id = getattr(self, "_java_scan_id", 0)
+
+        def worker():
+            valid = []
+            for path, version in cache:
+                if not os.path.isfile(path):
+                    continue
+                new_version = self.read_java_version(path) or version
+                if not new_version:
+                    continue
+                valid.append((path, new_version))
+            if validation_id != self._java_scan_id:
+                return
+            self.java_cache = valid
+            self._java_entries = None
+            self.ui_call(self.finish_java_check, len(valid))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_java_check(self, count):
+        self.refresh_java_combobox()
+        self.save_all()
+        if count == 0:
+            self.refresh_java_list(manual=False)
+            return
+        self.update_java_status(f"已加载 {count} 个 Java")
+
+    def refresh_java_list(self, manual=True):
+        """全盘扫描 java.exe, 获取版本后缓存"""
+        self._java_scan_id = getattr(self, "_java_scan_id", 0) + 1
+        scan_id = self._java_scan_id
+        self.update_java_status("正在全盘扫描 Java...")
+        try:
+            self.Java_Refresh_Button.config(state="disabled")
+        except AttributeError:
+            pass
+
+        def worker():
+            try:
+                found = self.scan_java_disks(scan_id)
+            except Exception as exp:
+                print(f"[WARN] 扫描 Java 失败: {exp}")
+                self.ui_call(self.update_java_status, f"扫描 Java 失败: {exp}")
+                self.ui_call(self.finish_java_scan, None, scan_id)
+                return
+            if scan_id != self._java_scan_id:
+                return
+            self.java_cache = found
+            self._java_entries = None
+            self.ui_call(self.finish_java_scan, found, scan_id)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_java_scan(self, found, scan_id):
+        if scan_id != getattr(self, "_java_scan_id", 0):
+            return
+        try:
+            self.Java_Refresh_Button.config(state="normal")
+        except AttributeError:
+            pass
+        if found is None:
+            return
+        self.refresh_java_combobox()
+        self.save_all()
+        self.update_java_status(f"已找到 {len(found)} 个 Java")
+
+    def get_java_scan_roots(self):
+        """获取需要扫描的硬盘根目录(跳过光驱/网络盘)"""
+        roots = []
+        try:
+            import ctypes
+
+            for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                root = f"{letter}:\\"
+                if not os.path.exists(root):
+                    continue
+                drive_type = ctypes.windll.kernel32.GetDriveTypeW(
+                    ctypes.c_wchar_p(root)
+                )
+                if drive_type in (2, 3):  # 可移动磁盘 / 本地磁盘
+                    roots.append(root)
+        except Exception:
+            roots = [
+                f"{letter}:\\"
+                for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ"
+                if os.path.exists(f"{letter}:\\")
+            ]
+        return roots
+
+    def scan_java_disks(self, scan_id):
+        results = []
+        seen = set()
+        for root in self.get_java_scan_roots():
+            if scan_id != self._java_scan_id:
+                return results
+            self.scan_java_root(root, results, seen, scan_id)
+        return results
+
+    def scan_java_root(self, root, results, seen, scan_id):
+        scanned = 0
+        for current, dirs, files in os.walk(
+            root, topdown=True, onerror=lambda error: None
+        ):
+            if scan_id != self._java_scan_id:
+                return
+            dirs[:] = [
+                name
+                for name in dirs
+                if name.lower() not in JAVA_SCAN_SKIP_DIRS
+                and not os.path.islink(os.path.join(current, name))
+            ]
+            scanned += 1
+            if scanned % 800 == 0:
+                self.ui_call(
+                    self.update_java_status,
+                    f"正在扫描 {root} ... 已找到 {len(results)} 个",
+                )
+            java_name = None
+            for name in files:
+                if name.lower() == "java.exe":
+                    java_name = name
+                    break
+            if java_name is None:
+                continue
+            java_path = os.path.join(current, java_name)
+            key = os.path.normcase(os.path.abspath(java_path))
+            if key in seen:
+                continue
+            version = self.read_java_version(java_path)
+            if not version:
+                continue
+            seen.add(key)
+            javaw_path = os.path.join(current, "javaw.exe")
+            launch_path = javaw_path if os.path.isfile(javaw_path) else java_path
+            results.append((launch_path.replace("\\", "/"), version))
 
     def copy_to_version_folder(self, source, folder):
         """把文件复制到当前版本对应的文件夹中"""
@@ -3843,6 +4096,8 @@ class MinecraftLauncher:
                     + f"VerSplit = {self.Versplitvar}\n"
                     + f"curJava = {self.CurJavaVar}\n"
                     + f"exJava = {self.exjavaplace!r}\n"
+                    + f"JavaCache = {self.java_cache!r}\n"
+                    + f"SelectedJava = {self.selected_java_path!r}\n"
                 )
         except OSError as exp:
             print(f"[ERROR] 保存配置失败: {exp}")
