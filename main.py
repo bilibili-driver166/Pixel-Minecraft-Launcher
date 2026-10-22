@@ -376,6 +376,7 @@ class MinecraftLauncher:
         self.current_progress = 0
         self.progress_window = None
         self.downloading = False
+        self.close_button_visible = False
 
     def __init__(self):
         self._ui_queue = queue.Queue()
@@ -427,13 +428,14 @@ class MinecraftLauncher:
         )
         self.Modify_Button.place(x=880, y=610)
         # 关闭所有正在运行的 Minecraft 游戏(类似 PCL)
+        # 默认隐藏, 检测到有游戏运行时才显示
         self.CloseGames_Button = tk.Button(
             self.main_win,
             text="关闭所有游戏",
             relief="groove",
             command=self.close_all_games,
         )
-        self.CloseGames_Button.place(x=15, y=572)
+        self.close_button_visible = False
 
         self.create_all()
         self.create_main()
@@ -447,6 +449,7 @@ class MinecraftLauncher:
         )
         self.Label.place(x=15, y=610)
 
+        self.start_game_watcher()
         self.main_win.after(100, self._process_ui_queue)
         self.main_win.mainloop()
 
@@ -500,6 +503,24 @@ class MinecraftLauncher:
         ).start()
         self.Modify_Button.config(state=tk.DISABLED)
 
+    def any_java_processes(self):
+        """快速判断系统里是否有 java/javaw 进程"""
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        for image in ("javaw.exe", "java.exe"):
+            try:
+                output = subprocess.check_output(
+                    ["tasklist", "/FI", f"IMAGENAME eq {image}", "/NH"],
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    creationflags=creation_flags,
+                ).decode("utf-8", errors="ignore")
+            except Exception:
+                # 无法判断时保守地认为可能有, 交给 wmic 继续确认
+                return True
+            if image.lower() in output.lower():
+                return True
+        return False
+
     def get_running_game_processes(self):
         """找出正在运行的 Minecraft 客户端进程 PID"""
         pids = set()
@@ -509,6 +530,9 @@ class MinecraftLauncher:
                     pids.add(process.pid)
             except Exception:
                 continue
+        # 没有 java 进程时直接返回, 避免每次轮询都去调用 wmic
+        if not pids and not self.any_java_processes():
+            return []
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         output = ""
         try:
@@ -567,6 +591,33 @@ class MinecraftLauncher:
                     pids.add(int(line))
         return sorted(pids)
 
+    def set_close_button_visible(self, visible):
+        """根据是否有游戏运行来显示/隐藏"关闭所有游戏"按钮"""
+        if visible and not getattr(self, "close_button_visible", False):
+            self.CloseGames_Button.place(x=15, y=572)
+            self.close_button_visible = True
+        elif not visible and getattr(self, "close_button_visible", False):
+            self.CloseGames_Button.place_forget()
+            self.close_button_visible = False
+
+    def start_game_watcher(self):
+        """后台定时检测是否有游戏在运行, 用来控制按钮显示"""
+
+        def watch():
+            last_state = False
+            while True:
+                try:
+                    state = bool(self.get_running_game_processes())
+                except Exception as exp:
+                    print(f"[WARN] 游戏进程检测失败: {exp}")
+                    state = last_state
+                if state != last_state:
+                    last_state = state
+                    self.ui_call(self.set_close_button_visible, state)
+                time.sleep(5)
+
+        threading.Thread(target=watch, daemon=True).start()
+
     def close_all_games(self):
         """关闭所有 Minecraft 游戏进程(类似 PCL)"""
         try:
@@ -599,6 +650,10 @@ class MinecraftLauncher:
                     closed += 1
             except Exception as exp:
                 print(f"[WARN] 无法结束进程 {pid}: {exp}")
+        try:
+            self.set_close_button_visible(bool(self.get_running_game_processes()))
+        except Exception:
+            self.set_close_button_visible(False)
         tkinter.messagebox.showinfo(
             "完成", f"已关闭 {closed} 个游戏进程（共找到 {len(pids)} 个）。"
         )
@@ -1622,6 +1677,7 @@ class MinecraftLauncher:
             print(f"[INFO] 启动命令: {subprocess.list2cmdline(minecraft_command)}")
             process = subprocess.Popen(minecraft_command, cwd=game_directory)
             self.game_processes.append(process)
+            self.ui_call(self.set_close_button_visible, True)
             try:
                 process.wait()
             finally:
@@ -1629,6 +1685,9 @@ class MinecraftLauncher:
                     self.game_processes.remove(process)
                 except ValueError:
                     pass
+                self.ui_call(
+                    self.set_close_button_visible, bool(self.game_processes)
+                )
             if process.returncode != 0:
                 print(f"[WARN] 游戏进程已退出, 返回码: {process.returncode}")
         except mll.exceptions.VersionNotFound:
@@ -2310,6 +2369,13 @@ class MinecraftLauncher:
         self.DownloadButton.config(state=tk.NORMAL)
         self.status = "下载完成" if success else "下载失败"
         self.update_progress_ui()
+        # 如果进度窗口开着(或被隐藏了), 把结果显示出来
+        if self.progress_window_exists():
+            try:
+                self.progress_window.deiconify()
+                self.progress_window.lift()
+            except tk.TclError:
+                pass
 
     def progress_window_exists(self):
         try:
@@ -2463,7 +2529,9 @@ class MinecraftLauncher:
         except Exception as exp:
             print(f"[ERROR] 下载失败: {exp}")
             self.ui_call(
-                tkinter.messagebox.showerror, "错误!", f"下载失败:{exp}"
+                tkinter.messagebox.showerror,
+                "下载失败",
+                f"{version} 下载失败：{exp}",
             )
             self.ui_call(self.finish_download_ui, False)
             return
@@ -2472,7 +2540,9 @@ class MinecraftLauncher:
         self.ui_call(self.reload_mod_tkinter)
         self.ui_call(self.finish_download_ui, True)
         self.ui_call(
-            tkinter.messagebox.showinfo, "Pixel Minecraft Launcher", "下载完成!"
+            tkinter.messagebox.showinfo,
+            "下载完成",
+            f"{version}（{mod_loader}）下载完成！",
         )
 
     def resolve_server_jar(self, server_path):
