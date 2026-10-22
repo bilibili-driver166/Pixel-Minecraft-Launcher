@@ -13,6 +13,7 @@ import locale
 import queue
 import re
 import struct
+import urllib.parse
 import urllib.request
 import uuid
 import zipfile
@@ -45,6 +46,19 @@ ISOLATION_MOD = 1
 ISOLATION_FULL = 2
 ISOLATION_VALUES = ["不开启版本隔离", "隔离mod", "完全隔离"]
 _NOT_GIVEN = object()
+
+# 愚人节版本(不在 type 里体现, 需要单独列出来)
+APRIL_FOOLS_VERSIONS = {
+    "2.0",
+    "15w14a",
+    "1.RV-Pre1",
+    "3D Shareware v1.34",
+    "20w14∞",
+    "22w13oneBlockAtATime",
+    "23w13a_or_b",
+    "24w14potato",
+    "25w14craftmine",
+}
 
 # 官方下载地址 -> BMCLAPI 镜像地址, 官方源失败时自动回退
 MIRROR_HOSTS = (
@@ -1178,15 +1192,8 @@ class MinecraftLauncher:
             controller=animation.smooth,
         ).start()
         animation.MoveTkWidget(
-            self.version_listbox,
-            (0, -500),
-            500,
-            fps=60,
-            controller=animation.smooth,
-        ).start()
-        animation.MoveTkWidget(
             self.VersionDescription,
-            (1000, 0),
+            (1295, 0),
             500,
             fps=60,
             controller=animation.smooth,
@@ -1465,94 +1472,172 @@ class MinecraftLauncher:
             self.main_win, text="🏠", command=self.delete_download
         )
         self.Menu_Butt_download.place(x=-50, y=5)
-        self.version_listbox = tk.Listbox(self.main_win, width=40, height=25)
-        self.version_listbox.place(x=30, y=-495)
-        self.version_listbox.insert(tk.END, "正在加载...")
         self.VersionDescription = ttk.Frame(
-            self.main_win, width=750, height=454, relief="ridge"
+            self.main_win, width=1075, height=454, relief="ridge"
         )
         self.VersionDescription.place(x=1350, y=5)
         self.VersionDescriptionLabel = tk.Label(
             self.VersionDescription, text="下载中心", font=("等线", 25)
         )
         self.VersionDescriptionLabel.place(x=20, y=0)
-        self.SupportForgeLabel = tk.Label(self.VersionDescription, text="Forge支持:")
-        self.SupportForgeLabel.place(x=20, y=60)
-        self.SupportFabricLabel = tk.Label(self.VersionDescription, text="Fabric支持:")
-        self.SupportFabricLabel.place(x=20, y=80)
-        self.ModLoaderLabel = tk.Label(self.VersionDescription, text="选择模组加载器:")
-        self.ModLoaderLabel.place(x=20, y=100)
+
+        # 用 Notebook 做 5 个下载分类
+        self.DownloadNotebook = ttk.Notebook(self.VersionDescription)
+        self.DownloadNotebook.place(x=8, y=42, width=1059, height=404)
+        self.VersionTab = ttk.Frame(self.DownloadNotebook)
+        self.ModTab = ttk.Frame(self.DownloadNotebook)
+        self.ModpackTab = ttk.Frame(self.DownloadNotebook)
+        self.ResourcepackTab = ttk.Frame(self.DownloadNotebook)
+        self.ShaderTab = ttk.Frame(self.DownloadNotebook)
+        self.DownloadNotebook.add(self.VersionTab, text="版本下载")
+        self.DownloadNotebook.add(self.ModTab, text="模组下载")
+        self.DownloadNotebook.add(self.ModpackTab, text="整合包")
+        self.DownloadNotebook.add(self.ResourcepackTab, text="资源包")
+        self.DownloadNotebook.add(self.ShaderTab, text="光影")
+        self.DownloadNotebook.bind(
+            "<<NotebookTabChanged>>", self.on_download_tab_changed
+        )
+        for tab, tab_name in (
+            (self.ModpackTab, "整合包"),
+            (self.ResourcepackTab, "资源包"),
+            (self.ShaderTab, "光影"),
+        ):
+            tk.Label(
+                tab,
+                text=f"「{tab_name}」下载功能将在后续版本加入。",
+                font=("等线", 15),
+                wraplength=1150,
+                justify="left",
+            ).place(x=10, y=20)
+
+        # ---- 版本下载: 搜索 + 版本列表 + 加载器 ----
+        self.VersionSearchFrame = tk.Frame(self.VersionTab, width=300, height=30)
+        self.VersionSearchFrame.place(x=10, y=2)
+        self.VersionSearchLabel = tk.Label(self.VersionSearchFrame, text="搜索:")
+        self.VersionSearchLabel.place(x=0, y=5)
+        self.version_search_var = tk.StringVar()
+        self.VersionSearchEntry = tk.Entry(
+            self.VersionSearchFrame, textvariable=self.version_search_var, width=14
+        )
+        self.VersionSearchEntry.place(x=40, y=3)
+        self.VersionSearchEntry.bind("<KeyRelease>", self.apply_version_filters)
+        self.version_type_filter = tk.StringVar(value="全部")
+        self.VersionTypeCombobox = ttk.Combobox(
+            self.VersionSearchFrame,
+            textvariable=self.version_type_filter,
+            values=["全部", "正式版", "测试版", "愚人节版本", "远古版本"],
+            state="readonly",
+            width=10,
+        )
+        self.VersionTypeCombobox.place(x=170, y=1)
+        self.VersionTypeCombobox.bind(
+            "<<ComboboxSelected>>", self.apply_version_filters
+        )
+        self.version_listbox = tk.Listbox(self.VersionTab, width=40, height=18)
+        self.version_listbox.place(x=10, y=38)
+        self.version_listbox.insert(tk.END, "正在加载...")
+
+        self.SupportForgeLabel = tk.Label(self.VersionTab, text="Forge支持:")
+        self.SupportForgeLabel.place(x=360, y=12)
+        self.SupportFabricLabel = tk.Label(self.VersionTab, text="Fabric支持:")
+        self.SupportFabricLabel.place(x=360, y=32)
+        self.ModLoaderLabel = tk.Label(self.VersionTab, text="选择模组加载器:")
+        self.ModLoaderLabel.place(x=360, y=52)
         self.ModLoader = tk.StringVar()
         self.ModLoader.set("原版")
         self.ModLoaderOption = ttk.Combobox(
-            self.VersionDescription,
+            self.VersionTab,
             textvariable=self.ModLoader,
             values=["原版"],
             state="readonly",
         )
-        self.ModLoaderOption.place(x=150, y=100)
+        self.ModLoaderOption.place(x=490, y=52)
         self.ModLoaderOption.bind(
             "<<ComboboxSelected>>", self.get_mod_loader_version_theard
         )
         self.ModLoaderVersionLabel = tk.Label(
-            self.VersionDescription, text="选择Mod加载器版本:"
+            self.VersionTab, text="选择Mod加载器版本:"
         )
-        self.ModLoaderVersionLabel.place(x=20, y=120)
+        self.ModLoaderVersionLabel.place(x=360, y=72)
         self.ModLoaderVersion = tk.StringVar()
         self.ModLoaderVersionOption = ttk.Combobox(
-            self.VersionDescription,
+            self.VersionTab,
             textvariable=self.ModLoaderVersion,
             values=[],
-            state="normal",  # 允许手动输入版本号(网络获取失败时也能用)
+            state="normal",
             width=24,
         )
-        self.ModLoaderVersionOption.place(x=150, y=120)
+        self.ModLoaderVersionOption.place(x=490, y=72)
         self.DownloadButton = tk.Button(
-            self.VersionDescription,
+            self.VersionTab,
             text="下载Minecraft",
             width=30,
             height=1,
             command=self.download_minecraft_version_theard,
         )
-        self.DownloadButton.place(x=20, y=150)
+        self.DownloadButton.place(x=360, y=100)
 
-        # ---- 下载中心分类 ----
-        self.DownloadCategories = ["游戏版本", "模组", "整合包", "资源包", "光影"]
-        self.DownloadCategoryButtons = {}
-        self.download_category = None
-        category_x = 260
-        for category in self.DownloadCategories:
-            category_button = tk.Button(
-                self.VersionDescription,
-                text=category,
-                relief="ridge",
-                width=6,
-                command=lambda name=category: self.switch_download_category(name),
-            )
-            category_button.place(x=category_x, y=6)
-            self.DownloadCategoryButtons[category] = category_button
-            category_x += 80
-        self.download_version_widgets = [
-            (self.SupportForgeLabel, 20, 60),
-            (self.SupportFabricLabel, 20, 80),
-            (self.ModLoaderLabel, 20, 100),
-            (self.ModLoaderOption, 150, 100),
-            (self.ModLoaderVersionLabel, 20, 120),
-            (self.ModLoaderVersionOption, 150, 120),
-            (self.DownloadButton, 20, 150),
-        ]
-        self.DownloadPlaceholder = ttk.Frame(
-            self.VersionDescription, width=700, height=330
+        # ---- 模组下载 ----
+        self.ModNameVar = tk.StringVar()
+        self.ModVersionVar = tk.StringVar()
+        self.ModSourceVar = tk.StringVar(value="全部")
+        self.ModStatusVar = tk.StringVar(value="")
+        self.mod_search_results = []
+        self.mod_selected_result = None
+        self.ModPanel = ttk.Frame(self.ModTab, width=1045, height=350)
+        self.ModPanel.place(x=0, y=0)
+        tk.Label(self.ModPanel, text="模组名称:").place(x=10, y=12)
+        self.ModNameEntry = tk.Entry(
+            self.ModPanel, textvariable=self.ModNameVar, width=26
         )
-        self.DownloadPlaceholderLabel = tk.Label(
-            self.DownloadPlaceholder,
-            text="",
-            font=("等线", 15),
-            wraplength=660,
+        self.ModNameEntry.place(x=100, y=10)
+        self.ModNameEntry.bind("<Return>", lambda event: self.search_mods())
+        self.ModSearchButton = ttk.Button(
+            self.ModPanel, text="搜索模组", command=self.search_mods
+        )
+        self.ModSearchButton.place(x=520, y=10)
+        tk.Label(self.ModPanel, text="游戏版本:").place(x=10, y=45)
+        self.ModVersionCombobox = ttk.Combobox(
+            self.ModPanel, textvariable=self.ModVersionVar, width=12
+        )
+        self.ModVersionCombobox.place(x=100, y=43)
+        tk.Label(self.ModPanel, text="来源:").place(x=300, y=45)
+        self.ModSourceCombobox = ttk.Combobox(
+            self.ModPanel,
+            textvariable=self.ModSourceVar,
+            values=["全部", "Modrinth", "CurseForge"],
+            state="readonly",
+            width=14,
+        )
+        self.ModSourceCombobox.place(x=350, y=43)
+        tk.Label(
+            self.ModPanel,
+            textvariable=self.ModStatusVar,
+            anchor="w",
             justify="left",
+            wraplength=1020,
+        ).place(x=10, y=75)
+        self.mod_results_listbox = tk.Listbox(self.ModPanel, width=38, height=12)
+        self.mod_results_listbox.place(x=10, y=105)
+        self.ModInfoLabel = tk.Label(
+            self.ModPanel,
+            text="",
+            anchor="nw",
+            justify="left",
+            wraplength=680,
+            height=10,
         )
-        self.DownloadPlaceholderLabel.place(x=10, y=20)
-        self.switch_download_category("游戏版本")
+        self.ModInfoLabel.place(x=360, y=105)
+        self.ModInstallButton = ttk.Button(
+            self.ModPanel,
+            text="下载并安装到当前版本",
+            command=self.install_selected_mod,
+            state="disabled",
+        )
+        self.ModInstallButton.place(x=360, y=290)
+
+        self.download_category = None
+        self.switch_download_category("版本下载")
 
         self.Menu_Butt_modify = tk.Button(
             self.main_win, text="🏠", command=self.delete_modify
@@ -1696,15 +1781,8 @@ class MinecraftLauncher:
             controller=animation.smooth,
         ).start()
         animation.MoveTkWidget(
-            self.version_listbox,
-            (0, 500),
-            500,
-            fps=60,
-            controller=animation.smooth,
-        ).start()
-        animation.MoveTkWidget(
             self.VersionDescription,
-            (-1000, 0),
+            (-1295, 0),
             500,
             fps=60,
             controller=animation.smooth,
@@ -3634,7 +3712,7 @@ class MinecraftLauncher:
                 self.username_listbox.insert(tk.END, i)
 
     def check_support(self, *args):
-        if getattr(self, "download_category", "游戏版本") != "游戏版本":
+        if getattr(self, "download_category", "版本下载") != "版本下载":
             return
         selection = self.version_listbox.curselection()
         if selection == ():
@@ -4006,15 +4084,8 @@ class MinecraftLauncher:
             controller=animation.smooth,
         ).start()
         animation.MoveTkWidget(
-            self.version_listbox,
-            (0, -500),
-            500,
-            fps=60,
-            controller=animation.smooth,
-        ).start()
-        animation.MoveTkWidget(
             self.VersionDescription,
-            (1000, 0),
+            (1295, 0),
             500,
             fps=60,
             controller=animation.smooth,
@@ -4606,59 +4677,326 @@ class MinecraftLauncher:
         ).start()
 
     def switch_download_category(self, name):
-        if name not in self.DownloadCategoryButtons:
+        for index in range(self.DownloadNotebook.index("end")):
+            if str(self.DownloadNotebook.tab(index, "text")) == name:
+                self.DownloadNotebook.select(index)
+                self.set_download_category(name)
+                return
+
+    def on_download_tab_changed(self, event=None):
+        try:
+            selected = self.DownloadNotebook.select()
+            name = str(self.DownloadNotebook.tab(selected, "text"))
+        except tk.TclError:
             return
+        self.set_download_category(name)
+
+    def set_download_category(self, name):
         if getattr(self, "download_category", None) == name:
             return
         self.download_category = name
-        for category, button in self.DownloadCategoryButtons.items():
-            button.config(relief="sunken" if category == name else "ridge")
-        if name == "游戏版本":
-            self.DownloadPlaceholder.place_forget()
-            for widget, x, y in self.download_version_widgets:
-                widget.place(x=x, y=y)
+        if name == "版本下载":
             self.restore_download_version_list()
-        else:
-            for widget, _x, _y in self.download_version_widgets:
-                widget.place_forget()
-            self.DownloadPlaceholderLabel.config(
-                text=(
-                    f"「{name}」下载功能将在后续版本加入。\n\n"
-                    "现在可以切换到「游戏版本」下载游戏，"
-                    "或者用杂项设置里的 NBT 查看器编辑存档。"
-                )
-            )
-            self.DownloadPlaceholder.place(x=20, y=60)
-            self.show_download_category_hint(name)
+        elif name == "模组下载":
+            self.show_mod_panel()
 
-    def show_download_category_hint(self, name):
-        try:
-            self.version_listbox.unbind("<<ListboxSelect>>")
-            self.version_listbox.delete(0, tk.END)
-            self.version_listbox.insert(tk.END, f"「{name}」暂未支持")
-        except tk.TclError:
-            pass
+    def show_mod_panel(self):
+        base_version = self.get_selected_base_version()
+        if base_version:
+            self.ModVersionVar.set(base_version)
+        items = getattr(self, "version_list_items", None) or []
+        if items:
+            self.ModVersionCombobox.config(values=[item["id"] for item in items])
+        self.ModStatusVar.set(
+            "来源：Modrinth 可直接搜索；CurseForge 官方 API 需要 Key，暂未接入。"
+        )
+        self.ModInfoLabel.config(text="")
+        self.ModInstallButton.config(state="disabled")
+        self.mod_search_results = []
+        self.mod_selected_result = None
+        self.mod_results_listbox.delete(0, tk.END)
+        self.mod_results_listbox.insert(tk.END, "输入模组名称后点「搜索模组」")
+        self.mod_results_listbox.bind("<<ListboxSelect>>", self.on_mod_select)
 
     def restore_download_version_list(self):
+        self.apply_version_filters()
+
+    def classify_version(self, item):
+        version_id = str(item.get("id", ""))
+        if version_id in APRIL_FOOLS_VERSIONS:
+            return "愚人节版本"
+        version_type = item.get("type", "")
+        if version_type == "release":
+            return "正式版"
+        if version_type in ("old_alpha", "old_beta"):
+            return "远古版本"
+        return "测试版"
+
+    def apply_version_filters(self, *args):
+        if getattr(self, "download_category", "版本下载") != "版本下载":
+            return
+        items = getattr(self, "version_list_items", None)
+        self.version_listbox.delete(0, tk.END)
+        if items is None:
+            self.version_listbox.insert(tk.END, "正在加载...")
+            return
+        if not items:
+            self.version_listbox.insert(tk.END, "网络不畅，请稍后重试。")
+            return
+        keyword = self.version_search_var.get().strip().lower()
+        category = self.version_type_filter.get()
+        filtered = []
+        for item in items:
+            if category != "全部" and self.classify_version(item) != category:
+                continue
+            if keyword and keyword not in str(item.get("id", "")).lower():
+                continue
+            filtered.append(item)
+        self.filtered_version_items = filtered
+        if not filtered:
+            self.version_listbox.insert(tk.END, "没有匹配的版本")
+        for item in filtered:
+            self.version_listbox.insert(tk.END, item["id"])
+        self.version_listbox.bind("<<ListboxSelect>>", self.check_support)
+
+    def on_mod_select(self, *args):
+        selection = self.mod_results_listbox.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        if not 0 <= index < len(self.mod_search_results):
+            return
+        result = self.mod_search_results[index]
+        self.mod_selected_result = result
+        lines = [str(result.get("title", ""))]
+        description = str(result.get("description", ""))
+        if description:
+            lines.append(description)
+        meta = []
+        if result.get("author"):
+            meta.append("作者: " + str(result["author"]))
+        if result.get("downloads") is not None:
+            meta.append("下载: " + str(result["downloads"]))
+        meta.append("来源: " + str(result.get("source", "Modrinth")))
+        lines.append("    ".join(meta))
+        self.ModInfoLabel.config(text="\n".join(line for line in lines if line))
+        self.ModInstallButton.config(state="normal")
+
+    def search_mods(self):
+        name = self.ModNameVar.get().strip()
+        if len(name) < 2:
+            tkinter.messagebox.showinfo("提示", "请输入至少 2 个字符的模组名称。")
+            return
+        source = self.ModSourceVar.get()
+        if source == "CurseForge":
+            tkinter.messagebox.showinfo(
+                "CurseForge",
+                "CurseForge 官方 API 需要 API Key，目前还没有接入。\n"
+                "请先选择 Modrinth 或「全部」（只搜索 Modrinth）。",
+            )
+            return
+        mc_version = (
+            self.ModVersionVar.get().strip() or self.get_selected_base_version()
+        )
+        loader = self.get_selected_mod_loader()
+        self.ModStatusVar.set("正在搜索...")
+        self.ModInstallButton.config(state="disabled")
+        self.ModInfoLabel.config(text="")
+
+        def worker():
+            try:
+                results = self.fetch_modrinth_mods(name, mc_version, loader)
+            except Exception as exp:
+                self.ui_call(self.ModStatusVar.set, f"搜索失败: {exp}")
+                return
+            self.ui_call(self.populate_mod_results, results, source)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def fetch_modrinth_mods(self, name, mc_version, loader):
+        facets = [[f"versions:{mc_version}"]]
+        if loader:
+            facets.append([f"categories:{loader}"])
+        params = urllib.parse.urlencode(
+            {
+                "query": name,
+                "limit": 20,
+                "index": "relevance",
+                "facets": json.dumps(facets),
+            }
+        )
+        request = urllib.request.Request(
+            "https://api.modrinth.com/v2/search?" + params,
+            headers={"User-Agent": "PixelMinecraftLauncher/4.4"},
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.load(response)
+        results = []
+        for hit in data.get("hits", []):
+            results.append(
+                {
+                    "project_id": hit.get("project_id"),
+                    "slug": hit.get("slug"),
+                    "title": hit.get("title"),
+                    "description": hit.get("description"),
+                    "author": hit.get("author"),
+                    "downloads": hit.get("downloads"),
+                    "source": "Modrinth",
+                }
+            )
+        return results
+
+    def populate_mod_results(self, results, source):
+        self.mod_search_results = results
+        self.mod_selected_result = None
+        self.mod_results_listbox.delete(0, tk.END)
+        if not results:
+            self.mod_results_listbox.insert(tk.END, "没有找到匹配的模组")
+            self.ModStatusVar.set("没有找到匹配的模组，换个关键词或版本试试。")
+            return
+        for result in results:
+            self.mod_results_listbox.insert(tk.END, result["title"])
+        self.mod_results_listbox.bind("<<ListboxSelect>>", self.on_mod_select)
+        note = "（CurseForge 暂未接入）" if source == "全部" else ""
+        self.ModStatusVar.set(
+            f"找到 {len(results)} 个结果，点左侧选择后安装。{note}"
+        )
+
+    def install_selected_mod(self):
+        result = self.mod_selected_result
+        if not result:
+            tkinter.messagebox.showinfo("提示", "请先在左侧选择一个模组。")
+            return
+        mc_version = (
+            self.ModVersionVar.get().strip() or self.get_selected_base_version()
+        )
+        loader = self.get_selected_mod_loader()
+        if not loader:
+            tkinter.messagebox.showerror(
+                "无法安装",
+                "当前版本不是 Fabric / Forge / NeoForge / Quilt 版本，不能安装模组。",
+            )
+            return
+        self.ModInstallButton.config(state="disabled")
+        self.ModStatusVar.set("正在解析下载地址...")
+
+        def worker():
+            try:
+                url, filename = self.resolve_modrinth_file(
+                    result["project_id"], mc_version, loader
+                )
+                self.ui_call(self.ModStatusVar.set, f"正在下载 {filename} ...")
+                target = self.download_mod_file(url, filename)
+            except Exception as exp:
+                self.ui_call(self.ModStatusVar.set, f"安装失败: {exp}")
+                self.ui_call(self.ModInstallButton.config, state="normal")
+                return
+            self.ui_call(self.ModStatusVar.set, f"已安装: {target}")
+            self.ui_call(
+                tkinter.messagebox.showinfo,
+                "安装完成",
+                f"已下载到:\n{target}\n\n启动游戏即可生效。",
+            )
+            self.ui_call(self.ModInstallButton.config, state="normal")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def resolve_modrinth_file(self, project_id, mc_version, loader):
+        params = urllib.parse.urlencode(
+            {
+                "game_versions": json.dumps([mc_version]),
+                "loaders": json.dumps([loader]),
+            }
+        )
+        request = urllib.request.Request(
+            f"https://api.modrinth.com/v2/project/{project_id}/version?{params}",
+            headers={"User-Agent": "PixelMinecraftLauncher/4.4"},
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            versions = json.load(response)
+        if not versions:
+            raise ValueError("没有找到适配当前版本和加载器的文件")
+        files = versions[0].get("files") or []
+        if not files:
+            raise ValueError("这个版本没有可下载的文件")
+        primary = None
+        for item in files:
+            if item.get("primary"):
+                primary = item
+                break
+        if primary is None:
+            primary = files[0]
+        return primary["url"], primary.get("filename") or "mod.jar"
+
+    def download_mod_file(self, url, filename):
+        mods_dir = os.path.join(
+            self.minecraft_dir, "versions", str(self.selected_version), "mods"
+        )
+        os.makedirs(mods_dir, exist_ok=True)
+        target = os.path.join(mods_dir, filename)
+        temp_path = target + ".tmp"
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "PixelMinecraftLauncher/4.4"}
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            with open(temp_path, "wb") as f:
+                shutil.copyfileobj(response, f)
+        os.replace(temp_path, target)
+        return target
+
+    def get_selected_version_json(self):
+        version = str(self.selected_version or "")
+        if not version:
+            return {}
+        path = os.path.join(
+            self.minecraft_dir, "versions", version, version + ".json"
+        )
         try:
-            self.version_listbox.delete(0, tk.END)
-            items = getattr(self, "version_list_items", None)
-            if items is None:
-                self.version_listbox.insert(tk.END, "正在加载...")
-            elif not items:
-                self.version_listbox.insert(tk.END, "网络不畅，请稍后重试。")
-            else:
-                for item in items:
-                    self.version_listbox.insert(tk.END, item["id"])
-            self.version_listbox.bind("<<ListboxSelect>>", self.check_support)
-        except tk.TclError:
-            pass
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def get_selected_base_version(self):
+        data = self.get_selected_version_json()
+        candidates = (
+            data.get("inheritsFrom"),
+            data.get("jar"),
+            data.get("id"),
+            str(self.selected_version or ""),
+        )
+        for candidate in candidates:
+            if not candidate:
+                continue
+            match = re.match(r"^(\d+\.\d+(?:\.\d+)?)", str(candidate))
+            if match:
+                return match.group(1)
+        return str(self.selected_version or "")
+
+    def get_selected_mod_loader(self):
+        data = self.get_selected_version_json()
+        text = " ".join(
+            [
+                str(data.get("id", "")),
+                str(data.get("inheritsFrom", "")),
+                json.dumps(data.get("libraries", []), ensure_ascii=False),
+            ]
+        ).lower()
+        if "neoforge" in text:
+            return "neoforge"
+        if "quilt" in text:
+            return "quilt"
+        if "fabric" in text:
+            return "fabric"
+        if "forge" in text:
+            return "forge"
+        return ""
 
     def from_menu_to_download_page(self):
         self.create_download()
         self.delete_main()
         self.download_page_open = True
-        self.switch_download_category("游戏版本")
+        self.switch_download_category("版本下载")
         self.set_current_page("download")
 
         def gtv():
@@ -4669,15 +5007,16 @@ class MinecraftLauncher:
 
     def reload_version_listbox(self, versionlist):
         self.version_list_items = versionlist
-        if getattr(self, "download_category", "游戏版本") != "游戏版本":
-            self.show_download_category_hint(self.download_category)
-            return
-        self.version_listbox.delete(0, tk.END)
-        if not versionlist:
-            self.version_listbox.insert(tk.END, "网络不畅，请稍后重试。")
-        for i in versionlist:
-            self.version_listbox.insert(tk.END, i["id"])
-        self.version_listbox.bind("<<ListboxSelect>>", self.check_support)
+        if versionlist:
+            try:
+                self.ModVersionCombobox.config(
+                    values=[item["id"] for item in versionlist]
+                )
+            except tk.TclError:
+                pass
+        if getattr(self, "download_category", "版本下载") == "版本下载":
+            self.apply_version_filters()
+
 
 
 MinecraftLauncher()
