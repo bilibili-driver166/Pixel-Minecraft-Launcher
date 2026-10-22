@@ -372,6 +372,10 @@ class MinecraftLauncher:
         self.download_version_to = ""
         self.support_fabric = ""
         self.support_forge = ""
+        self.game_processes = []
+        self.current_progress = 0
+        self.progress_window = None
+        self.downloading = False
 
     def __init__(self):
         self._ui_queue = queue.Queue()
@@ -422,6 +426,14 @@ class MinecraftLauncher:
             command=self.change_version_and_modify_version,
         )
         self.Modify_Button.place(x=880, y=610)
+        # 关闭所有正在运行的 Minecraft 游戏(类似 PCL)
+        self.CloseGames_Button = tk.Button(
+            self.main_win,
+            text="关闭所有游戏",
+            relief="groove",
+            command=self.close_all_games,
+        )
+        self.CloseGames_Button.place(x=15, y=572)
 
         self.create_all()
         self.create_main()
@@ -487,6 +499,109 @@ class MinecraftLauncher:
             controller=animation.smooth,
         ).start()
         self.Modify_Button.config(state=tk.DISABLED)
+
+    def get_running_game_processes(self):
+        """找出正在运行的 Minecraft 客户端进程 PID"""
+        pids = set()
+        for process in list(getattr(self, "game_processes", [])):
+            try:
+                if process.poll() is None:
+                    pids.add(process.pid)
+            except Exception:
+                continue
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        output = ""
+        try:
+            output = subprocess.check_output(
+                [
+                    "wmic",
+                    "process",
+                    "where",
+                    "name='java.exe' or name='javaw.exe'",
+                    "get",
+                    "ProcessId,CommandLine",
+                    "/FORMAT:CSV",
+                ],
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                creationflags=creation_flags,
+            ).decode("utf-8", errors="ignore")
+        except Exception as exp:
+            print(f"[WARN] wmic 列举进程失败: {exp}")
+            try:
+                output = subprocess.check_output(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        "Get-CimInstance Win32_Process -Filter "
+                        "\"Name='java.exe' or Name='javaw.exe'\" | "
+                        "Where-Object { $_.CommandLine -match 'minecraft' } | "
+                        "ForEach-Object { $_.ProcessId }",
+                    ],
+                    text=True,
+                    timeout=20,
+                    creationflags=creation_flags,
+                )
+            except Exception as powershell_exp:
+                print(f"[WARN] 无法枚举游戏进程: {powershell_exp}")
+                return sorted(pids)
+
+        if output and "ProcessId" in output and "," in output:
+            import csv
+            import io as _io
+
+            for row in csv.reader(_io.StringIO(output)):
+                if len(row) < 3 or not row[-1].strip().isdigit():
+                    continue
+                command_line = ",".join(row[1:-1])
+                if (
+                    "net.minecraft.client.main.Main" in command_line
+                    or "--accessToken" in command_line
+                ):
+                    pids.add(int(row[-1].strip()))
+        else:
+            for line in output.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    pids.add(int(line))
+        return sorted(pids)
+
+    def close_all_games(self):
+        """关闭所有 Minecraft 游戏进程(类似 PCL)"""
+        try:
+            pids = self.get_running_game_processes()
+        except Exception as exp:
+            print(f"[ERROR] 查找游戏进程失败: {exp}")
+            tkinter.messagebox.showerror("错误", f"查找游戏进程失败:{exp}")
+            return
+        if not pids:
+            tkinter.messagebox.showinfo("提示", "没有找到正在运行的 Minecraft 游戏。")
+            return
+        if not tkinter.messagebox.askyesno(
+            "关闭所有游戏",
+            f"找到 {len(pids)} 个正在运行的 Minecraft 游戏，确定全部关闭吗？\n"
+            "未保存的游戏进度可能会丢失。",
+        ):
+            return
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        closed = 0
+        for pid in pids:
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    creationflags=creation_flags,
+                )
+                if result.returncode == 0:
+                    closed += 1
+            except Exception as exp:
+                print(f"[WARN] 无法结束进程 {pid}: {exp}")
+        tkinter.messagebox.showinfo(
+            "完成", f"已关闭 {closed} 个游戏进程（共找到 {len(pids)} 个）。"
+        )
 
     def start_th(self):
         isolation_mode = self.get_isolation_mode()
@@ -920,6 +1035,13 @@ class MinecraftLauncher:
             command=self.download_minecraft_version_theard,
         )
         self.DownloadButton.place(x=20, y=150)
+        # 下载开始后才显示的进度按钮
+        self.ProgressButton = tk.Button(
+            self.VersionDescription,
+            text="查看下载进度",
+            command=self.show_download_progress,
+        )
+        self.progress_button_visible = False
 
         self.Menu_Butt_modify = tk.Button(
             self.main_win, text="🏠", command=self.delete_modify
@@ -1499,7 +1621,14 @@ class MinecraftLauncher:
             )
             print(f"[INFO] 启动命令: {subprocess.list2cmdline(minecraft_command)}")
             process = subprocess.Popen(minecraft_command, cwd=game_directory)
-            process.wait()
+            self.game_processes.append(process)
+            try:
+                process.wait()
+            finally:
+                try:
+                    self.game_processes.remove(process)
+                except ValueError:
+                    pass
             if process.returncode != 0:
                 print(f"[WARN] 游戏进程已退出, 返回码: {process.returncode}")
         except mll.exceptions.VersionNotFound:
@@ -1657,6 +1786,9 @@ class MinecraftLauncher:
                 pass
 
     def download_minecraft_version_theard(self):
+        if self.downloading:
+            tkinter.messagebox.showinfo("提示", "已经有下载任务正在进行中。")
+            return
         if not self.download_version_to:
             tkinter.messagebox.showerror("错误!", "你没有选择任何版本!")
             return
@@ -1664,6 +1796,7 @@ class MinecraftLauncher:
         mod_loader = self.ModLoader.get()
         loader_version = (self.ModLoaderVersion.get() or "").strip()
         java_path = self.get_launch_java()
+        self.start_download_ui()
         threading.Thread(
             target=self.download_version,
             args=(version, mod_loader, loader_version, java_path),
@@ -2141,14 +2274,116 @@ class MinecraftLauncher:
     def set_status(self, status: str):
         self.status = status
         print(f"下载状态：{status}")
+        self.ui_call(self.update_progress_ui)
 
     def set_progress(self, progress: int):
+        try:
+            self.current_progress = int(progress)
+        except (TypeError, ValueError):
+            self.current_progress = 0
         if self.current_max != 0:
             self.progress = f"{progress}/{self.current_max}"
             print(f"下载状态:{progress}/{self.current_max}")
+        self.ui_call(self.update_progress_ui)
 
     def set_max(self, new_max: int):
-        self.current_max = new_max
+        try:
+            self.current_max = int(new_max)
+        except (TypeError, ValueError):
+            self.current_max = 0
+        self.ui_call(self.update_progress_ui)
+
+    def start_download_ui(self):
+        """开始下载时重置进度并显示"查看下载进度"按钮"""
+        self.downloading = True
+        self.status = "正在准备下载..."
+        self.current_progress = 0
+        self.current_max = 0
+        self.DownloadButton.config(state=tk.DISABLED)
+        if not self.progress_button_visible:
+            self.ProgressButton.place(x=260, y=150)
+            self.progress_button_visible = True
+        self.update_progress_ui()
+
+    def finish_download_ui(self, success):
+        self.downloading = False
+        self.DownloadButton.config(state=tk.NORMAL)
+        self.status = "下载完成" if success else "下载失败"
+        self.update_progress_ui()
+
+    def progress_window_exists(self):
+        try:
+            return bool(
+                self.progress_window and self.progress_window.winfo_exists()
+            )
+        except tk.TclError:
+            return False
+
+    def create_progress_window(self):
+        self.progress_window = tk.Toplevel(self.main_win)
+        self.progress_window.title("下载进度")
+        self.progress_window.geometry("460x150")
+        self.progress_window.resizable(False, False)
+        self.progress_window.transient(self.main_win)
+        self.progress_window.protocol(
+            "WM_DELETE_WINDOW", self.progress_window.withdraw
+        )
+        self.progress_status_var = tk.StringVar(value="准备中...")
+        self.progress_percent_var = tk.StringVar(value="")
+        self.progress_value_var = tk.DoubleVar(value=0)
+        tk.Label(
+            self.progress_window,
+            textvariable=self.progress_status_var,
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        ).place(x=20, y=15)
+        self.progress_bar = ttk.Progressbar(
+            self.progress_window,
+            length=420,
+            maximum=100,
+            variable=self.progress_value_var,
+        )
+        self.progress_bar.place(x=20, y=60)
+        tk.Label(
+            self.progress_window, textvariable=self.progress_percent_var
+        ).place(x=20, y=88)
+        ttk.Button(
+            self.progress_window,
+            text="隐藏",
+            command=self.progress_window.withdraw,
+        ).place(x=380, y=112)
+        self.progress_window.update_idletasks()
+        x = self.main_win.winfo_rootx() + (self.main_win.winfo_width() - 460) // 2
+        y = self.main_win.winfo_rooty() + (self.main_win.winfo_height() - 150) // 2
+        self.progress_window.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def show_download_progress(self):
+        """显示下载进度窗口"""
+        if not self.progress_window_exists():
+            self.create_progress_window()
+        try:
+            self.progress_window.deiconify()
+            self.progress_window.lift()
+        except tk.TclError:
+            self.create_progress_window()
+        self.update_progress_ui()
+
+    def update_progress_ui(self):
+        if not self.progress_window_exists():
+            return
+        maximum = self.current_max or 0
+        value = self.current_progress or 0
+        if maximum > 0:
+            percent = value / maximum * 100
+            self.progress_bar.config(maximum=maximum)
+            self.progress_value_var.set(min(value, maximum))
+            self.progress_percent_var.set(f"{value}/{maximum} ({percent:.0f}%)")
+        else:
+            self.progress_bar.config(maximum=100)
+            self.progress_value_var.set(0)
+            self.progress_percent_var.set("正在准备...")
+        self.progress_status_var.set(getattr(self, "status", "") or "正在下载...")
 
     def download_version(
         self,
@@ -2177,6 +2412,7 @@ class MinecraftLauncher:
             self.ui_call(
                 tkinter.messagebox.showerror, "错误!", "你没有选择任何版本!"
             )
+            self.ui_call(self.finish_download_ui, False)
             return
         self.callback = {
             "setStatus": self.set_status,
@@ -2198,6 +2434,7 @@ class MinecraftLauncher:
                         f"没有找到 {version} 可用的 Forge 版本!\n"
                         "可以点开“选择Mod加载器版本”手动填写, 例如 47.2.0",
                     )
+                    self.ui_call(self.finish_download_ui, False)
                     return
                 install_options = {"callback": self.callback}
                 if java_path and supports_java_argument(
@@ -2221,16 +2458,19 @@ class MinecraftLauncher:
                 self.ui_call(
                     tkinter.messagebox.showerror, "错误!", "你没有选择任何模组加载器!"
                 )
+                self.ui_call(self.finish_download_ui, False)
                 return
         except Exception as exp:
             print(f"[ERROR] 下载失败: {exp}")
             self.ui_call(
                 tkinter.messagebox.showerror, "错误!", f"下载失败:{exp}"
             )
+            self.ui_call(self.finish_download_ui, False)
             return
 
         self.reload_versions()
         self.ui_call(self.reload_mod_tkinter)
+        self.ui_call(self.finish_download_ui, True)
         self.ui_call(
             tkinter.messagebox.showinfo, "Pixel Minecraft Launcher", "下载完成!"
         )
