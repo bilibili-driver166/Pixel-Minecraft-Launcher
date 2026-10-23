@@ -25,3 +25,5 @@ versions/
 source code/
 hs_err_pid*.log
 replay_pid*.log
+installer.jar.log
+*.jar.log

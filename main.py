@@ -13,6 +13,7 @@ import locale
 import queue
 import re
 import struct
+import tempfile
 import urllib.parse
 import urllib.request
 import uuid
@@ -829,6 +830,8 @@ class MinecraftLauncher:
         self.java_cache = []
         self.selected_java_path = ""
         self._java_scan_id = 0
+        self._neoforge_version_cache = {}
+        self._neoforge_metadata_cache = {}
         self.read_configs()
         self.save_selected = ""
         self.current_max = 0
@@ -1650,8 +1653,12 @@ class MinecraftLauncher:
         self.SupportForgeLabel.place(x=360, y=12)
         self.SupportFabricLabel = tk.Label(self.VersionTab, text="Fabric支持:")
         self.SupportFabricLabel.place(x=360, y=32)
+        self.SupportNeoForgeLabel = tk.Label(
+            self.VersionTab, text="NeoForge支持:"
+        )
+        self.SupportNeoForgeLabel.place(x=360, y=52)
         self.ModLoaderLabel = tk.Label(self.VersionTab, text="选择模组加载器:")
-        self.ModLoaderLabel.place(x=360, y=52)
+        self.ModLoaderLabel.place(x=360, y=72)
         self.ModLoader = tk.StringVar()
         self.ModLoader.set("原版")
         self.ModLoaderOption = ttk.Combobox(
@@ -1660,14 +1667,14 @@ class MinecraftLauncher:
             values=["原版"],
             state="readonly",
         )
-        self.ModLoaderOption.place(x=490, y=52)
+        self.ModLoaderOption.place(x=490, y=72)
         self.ModLoaderOption.bind(
             "<<ComboboxSelected>>", self.get_mod_loader_version_theard
         )
         self.ModLoaderVersionLabel = tk.Label(
             self.VersionTab, text="选择Mod加载器版本:"
         )
-        self.ModLoaderVersionLabel.place(x=360, y=72)
+        self.ModLoaderVersionLabel.place(x=360, y=92)
         self.ModLoaderVersion = tk.StringVar()
         self.ModLoaderVersionOption = ttk.Combobox(
             self.VersionTab,
@@ -1676,7 +1683,7 @@ class MinecraftLauncher:
             state="normal",
             width=24,
         )
-        self.ModLoaderVersionOption.place(x=490, y=72)
+        self.ModLoaderVersionOption.place(x=490, y=92)
         self.DownloadButton = tk.Button(
             self.VersionTab,
             text="下载Minecraft",
@@ -1684,7 +1691,7 @@ class MinecraftLauncher:
             height=1,
             command=self.download_minecraft_version_theard,
         )
-        self.DownloadButton.place(x=360, y=100)
+        self.DownloadButton.place(x=360, y=120)
 
         # ---- 模组下载 ----
         self.ModNameVar = tk.StringVar()
@@ -4069,6 +4076,9 @@ class MinecraftLauncher:
         def main():
             self.ui_call(self.SupportFabricLabel.config, text="Fabric支持:正在加载...")
             self.ui_call(self.SupportForgeLabel.config, text="Forge支持:正在加载...")
+            self.ui_call(
+                self.SupportNeoForgeLabel.config, text="NeoForge支持:正在加载..."
+            )
             try:
                 fabric_supported = bool(
                     mll.fabric.is_minecraft_version_supported(version)
@@ -4087,6 +4097,16 @@ class MinecraftLauncher:
                     if mirror_forge_versions is None
                     else bool(mirror_forge_versions)
                 )
+            try:
+                neoforge_versions = self.get_neoforge_versions(version)
+                neoforge_supported = (
+                    None
+                    if neoforge_versions is None
+                    else bool(neoforge_versions)
+                )
+            except Exception as exp:
+                print(f"[WARN] 检查 NeoForge 支持失败: {type(exp).__name__}")
+                neoforge_supported = None
             if fabric_supported is None:
                 fabric_state = "未知(网络异常)"
             else:
@@ -4095,6 +4115,10 @@ class MinecraftLauncher:
                 forge_state = "未知(网络异常)"
             else:
                 forge_state = "支持" if forge_supported else "不支持"
+            if neoforge_supported is None:
+                neoforge_state = "未知(网络异常)"
+            else:
+                neoforge_state = "支持" if neoforge_supported else "不支持"
             self.support_fabric = "true" if fabric_supported else "false"
             self.support_forge = "true" if forge_supported else "false"
             self.ui_call(
@@ -4103,11 +4127,17 @@ class MinecraftLauncher:
             self.ui_call(
                 self.SupportForgeLabel.config, text=f"Forge支持:{forge_state}"
             )
+            self.ui_call(
+                self.SupportNeoForgeLabel.config,
+                text=f"NeoForge支持:{neoforge_state}",
+            )
             mod_loaders = ["原版"]
             if fabric_supported is not False:
                 mod_loaders.append("Fabric")
             if forge_supported is not False:
                 mod_loaders.append("Forge")
+            if neoforge_supported is not False:
+                mod_loaders.append("NeoForge")
             self.ui_call(self.apply_mod_loader_support, mod_loaders)
 
         threading.Thread(target=main, daemon=True).start()
@@ -4552,6 +4582,21 @@ class MinecraftLauncher:
                     loader_version if loader_version else None,
                     **install_options,
                 )
+            elif mod_loader == "NeoForge":
+                neoforge_version = self.get_neoforge_version_id(
+                    loader_version, version
+                )
+                if not neoforge_version:
+                    self.ui_call(
+                        tkinter.messagebox.showerror,
+                        "错误!",
+                        f"没有找到 {version} 可用的 NeoForge 版本! "
+                        "可以点开“选择Mod加载器版本”手动填写, 例如 21.1.264",
+                    )
+                    self.ui_call(self.finish_download_ui, False)
+                    return
+                self.set_max(0)
+                self.install_neoforge(neoforge_version, version, java_path)
             else:
                 self.ui_call(
                     tkinter.messagebox.showerror, "错误!", "你没有选择任何模组加载器!"
@@ -4971,6 +5016,160 @@ class MinecraftLauncher:
                 output.append(fabric_version)
         return output
 
+    def get_neoforge_metadata(self, artifact):
+        """按 artifact 缓存 NeoForge maven-metadata 里的全部版本"""
+        cache = getattr(self, "_neoforge_metadata_cache", None)
+        if cache is not None and artifact in cache:
+            return cache[artifact]
+        urls = (
+            "https://maven.neoforged.net/releases/net/neoforged/"
+            f"{artifact}/maven-metadata.xml",
+            "https://bmclapi2.bangbang93.com/maven/net/neoforged/"
+            f"{artifact}/maven-metadata.xml",
+        )
+        text = None
+        for url in urls:
+            try:
+                request = urllib.request.Request(
+                    url, headers={"User-Agent": "PixelMinecraftLauncher/4.4"}
+                )
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    text = response.read().decode("utf-8", errors="ignore")
+                break
+            except Exception as exp:
+                print(
+                    f"[WARN] 获取 NeoForge metadata 失败 {url}: "
+                    f"{type(exp).__name__}"
+                )
+        versions = None
+        if text:
+            versions = re.findall(r"<version>([^<]+)</version>", text)
+        if cache is not None:
+            cache[artifact] = versions
+        return versions
+
+    def get_neoforge_versions(self, version: str):
+        """返回该 Minecraft 版本可用的 NeoForge 版本(新版本在前), 失败返回 None"""
+        version = str(version or "").strip()
+        if not version:
+            return None
+        cache = getattr(self, "_neoforge_version_cache", None)
+        if cache is not None and version in cache:
+            return cache[version]
+        artifact = "forge" if version == "1.20.1" else "neoforge"
+        if version == "1.20.1":
+            prefix = "1.20.1-"
+        else:
+            match = re.match(r"^1\.(\d+)(?:\.(\d+))?", version)
+            if not match:
+                return []
+            prefix = f"{int(match.group(1))}.{int(match.group(2) or 0)}."
+        all_versions = self.get_neoforge_metadata(artifact)
+        if all_versions is None:
+            return None
+        versions = []
+        for item in all_versions:
+            item = item.strip()
+            if item.startswith(prefix) and item not in versions:
+                versions.append(item)
+        versions.sort(key=forge_version_key, reverse=True)
+        if cache is not None:
+            cache[version] = versions
+        return versions
+
+    def get_neoforge_version_id(self, selected_version, minecraft_version):
+        """返回要安装的 NeoForge 版本号, 空/最新时取列表第一个"""
+        selected_version = (selected_version or "").strip()
+        if selected_version and selected_version != "最新版本":
+            if (
+                str(minecraft_version) == "1.20.1"
+                and not selected_version.startswith("1.20.1-")
+            ):
+                return f"1.20.1-{selected_version}"
+            return selected_version
+        versions = self.get_neoforge_versions(minecraft_version)
+        if versions:
+            return versions[0]
+        return None
+
+    def install_neoforge(self, neoforge_version, minecraft_version, java_path=None):
+        """下载 NeoForge 安装器并执行 --installClient"""
+        artifact = "forge" if str(minecraft_version) == "1.20.1" else "neoforge"
+        filename = f"{artifact}-{neoforge_version}-installer.jar"
+        urls = (
+            "https://bmclapi2.bangbang93.com/maven/net/neoforged/"
+            f"{artifact}/{neoforge_version}/{filename}",
+            "https://maven.neoforged.net/releases/net/neoforged/"
+            f"{artifact}/{neoforge_version}/{filename}",
+        )
+        temp_dir = tempfile.mkdtemp(prefix="pml_neoforge_")
+        installer_path = os.path.join(temp_dir, filename)
+        try:
+            self.set_status("正在下载 NeoForge 安装器...")
+            downloaded = False
+            last_error = None
+            for url in urls:
+                try:
+                    request = urllib.request.Request(
+                        url, headers={"User-Agent": "PixelMinecraftLauncher/4.4"}
+                    )
+                    with urllib.request.urlopen(request, timeout=60) as response:
+                        with open(installer_path, "wb") as f:
+                            shutil.copyfileobj(response, f)
+                    downloaded = True
+                    break
+                except Exception as exp:
+                    last_error = exp
+                    print(f"[WARN] 下载 NeoForge 安装器失败 {url}: {exp}")
+            if not downloaded:
+                raise RuntimeError(f"下载 NeoForge 安装器失败: {last_error}")
+
+            profile_path = os.path.join(
+                self.minecraft_dir, "launcher_profiles.json"
+            )
+            if not os.path.exists(profile_path):
+                with open(profile_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {"profiles": {}, "settings": {}, "version": 3}, f
+                    )
+
+            java_exe = java_path or "java"
+            if os.path.basename(str(java_exe)).lower() == "javaw.exe":
+                java_exe = os.path.join(os.path.dirname(java_exe), "java.exe")
+            self.set_status(f"正在安装 NeoForge {neoforge_version}...")
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            process = subprocess.Popen(
+                [
+                    java_exe,
+                    "-jar",
+                    installer_path,
+                    "--installClient",
+                    self.minecraft_dir,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                creationflags=creation_flags,
+                cwd=temp_dir,
+            )
+            output_tail = []
+            for line in process.stdout:
+                line = line.strip()
+                if line:
+                    output_tail.append(line)
+                    if len(output_tail) > 8:
+                        output_tail.pop(0)
+                    self.set_status(f"NeoForge: {line[:100]}")
+            return_code = process.wait()
+            if return_code != 0:
+                detail = " | ".join(output_tail[-3:])
+                raise RuntimeError(
+                    f"NeoForge 安装器退出码 {return_code}: {detail}"
+                )
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
     def load_mod_loader_version(self, loader=_NOT_GIVEN, version=_NOT_GIVEN):
         """后台获取模组加载器版本列表(参数在界面线程中读取后传入)"""
         if loader is _NOT_GIVEN:
@@ -4978,13 +5177,15 @@ class MinecraftLauncher:
         if version is _NOT_GIVEN:
             version = self.download_version_to
         values = []
-        if version and loader in ("Forge", "Fabric"):
+        if version and loader in ("Forge", "Fabric", "NeoForge"):
             self.ui_call(self.set_mod_loader_version_hint, "正在获取版本列表...")
             try:
                 if loader == "Forge":
                     values = self.get_forge_versions(version)
-                else:
+                elif loader == "Fabric":
                     values = self.get_fabric_versions(version)
+                else:
+                    values = self.get_neoforge_versions(version) or []
             except Exception as exp:
                 print(f"[ERROR] 加载模组加载器版本失败: {exp}")
                 values = []
@@ -4997,7 +5198,7 @@ class MinecraftLauncher:
 
     def apply_mod_loader_versions(self, values, loader):
         if not values:
-            if loader in ("Forge", "Fabric"):
+            if loader in ("Forge", "Fabric", "NeoForge"):
                 # 网络获取失败时仍然保留一个可用的默认选项, 也可以手动输入版本
                 self.ModLoaderVersionOption.config(values=["最新版本"])
                 self.ModLoaderVersion.set("最新版本")
